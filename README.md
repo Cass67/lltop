@@ -8,7 +8,7 @@ It is built for the current `ubt26` llama.cpp setup, but the paths and API URL c
 
 - AMD GPU utilization, VRAM, memory busy, clocks, temperature, and power from `/sys/class/drm`.
 - `llama-server` PID, CPU usage, RSS, runtime, and launch command.
-- llama.cpp API health and model endpoint status.
+- llama.cpp API health, model endpoint status, live tokens/sec from `/slots`, and last eval tokens/sec from logs.
 - Per-core CPU bars from `/proc/stat`.
 - Memory, swap, `vmstat`, and `iostat` summaries.
 - Recent `llama-*.log` lines from the llama.cpp directory.

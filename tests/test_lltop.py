@@ -114,6 +114,58 @@ class LltopTests(unittest.TestCase):
 
         self.assertEqual(lltop.cpu_percentages(before, after), [("0", 50), ("1", 20)])
 
+    def test_parse_slots_extracts_decoded_counts(self):
+        lltop = load_lltop()
+        body = '[{"id":0,"is_processing":true,"id_task":7,"next_token":[{"n_decoded":42}]},{"id":1,"is_processing":false,"id_task":8,"next_token":[{"n_decoded":3}]}]'
+
+        self.assertEqual(
+            lltop.parse_slots(body),
+            [
+                {"id": 0, "task": 7, "is_processing": True, "decoded": 42},
+                {"id": 1, "task": 8, "is_processing": False, "decoded": 3},
+            ],
+        )
+
+    def test_tps_tracker_computes_live_decode_rate(self):
+        lltop = load_lltop()
+        tracker = lltop.TpsTracker()
+
+        first = [{"id": 0, "task": 7, "is_processing": True, "decoded": 10}]
+        second = [{"id": 0, "task": 7, "is_processing": True, "decoded": 70}]
+
+        self.assertIsNone(tracker.update(first, now=100.0)["live_tps"])
+        self.assertEqual(
+            tracker.update(second, now=103.0),
+            {"live_tps": 20.0, "active_slots": 1, "total_slots": 1},
+        )
+
+    def test_collect_tps_marks_unavailable_slots_as_unknown(self):
+        lltop = load_lltop()
+        original_http = lltop.http_json_or_text
+        original_last_eval = lltop.read_last_eval_tps
+        try:
+            lltop.http_json_or_text = lambda *args, **kwargs: "unreachable: URLError"
+            lltop.read_last_eval_tps = lambda *args, **kwargs: None
+
+            stats = lltop.collect_tps("http://127.0.0.1:8080", Path("/tmp"), lltop.TpsTracker())
+        finally:
+            lltop.http_json_or_text = original_http
+            lltop.read_last_eval_tps = original_last_eval
+
+        self.assertEqual(
+            stats,
+            {"live_tps": None, "active_slots": "n/a", "total_slots": "n/a", "last_eval_tps": None},
+        )
+
+    def test_parse_last_eval_tps_ignores_prompt_eval(self):
+        lltop = load_lltop()
+        lines = [
+            "prompt eval time = 100.00 ms / 100 tokens (1.00 ms per token, 1000.00 tokens per second)",
+            "       eval time = 2000.00 ms / 100 tokens (20.00 ms per token, 50.00 tokens per second)",
+        ]
+
+        self.assertEqual(lltop.parse_last_eval_tps(lines), 50.0)
+
     def test_find_amd_gpu_device_reads_sysfs_metrics(self):
         lltop = load_lltop()
 
@@ -160,6 +212,17 @@ class LltopTests(unittest.TestCase):
         self.assertIn("qwen3-coder", output)
         self.assertIn("Recent log", output)
         self.assertIn("slot 0 idle", output)
+
+    def test_llama_panel_shows_token_throughput(self):
+        lltop = load_lltop()
+        snapshot = self.sample_snapshot()
+        snapshot["tps"] = {"live_tps": 58.9, "active_slots": 1, "total_slots": 4, "last_eval_tps": 59.5}
+
+        output = lltop.render_snapshot(snapshot, width=120, height=32)
+
+        self.assertIn("tokens/sec: live 58.9", output)
+        self.assertIn("active slots 1/4", output)
+        self.assertIn("last eval 59.5", output)
 
     def test_render_snapshot_uses_ascii_panels(self):
         lltop = load_lltop()
