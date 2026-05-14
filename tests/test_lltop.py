@@ -95,6 +95,12 @@ class LltopTests(unittest.TestCase):
 
         self.assertEqual(summary, "r 1 b 0 free 17758792 KiB in 4957 cs 5259 cpu 1u/2s/97i")
 
+    def test_compact_free_row_removes_padding(self):
+        lltop = load_lltop()
+        row = "Mem:            61Gi       8.2Gi       7.0Gi       123Mi        46Gi        53Gi"
+
+        self.assertEqual(lltop.compact_free_row(row), "Mem: 61Gi 8.2Gi 7.0Gi 123Mi 46Gi 53Gi")
+
     def test_cpu_percentages_from_proc_stat_samples(self):
         lltop = load_lltop()
         before = {
@@ -179,6 +185,44 @@ class LltopTests(unittest.TestCase):
         self.assertIn("01 [##--------] 20%", output)
         self.assertIn("Memory columns: total used free shared buff/cache available", output)
         self.assertIn("Swap columns: total used free", output)
+
+    def test_join_columns_places_blocks_side_by_side(self):
+        lltop = load_lltop()
+
+        output = lltop.join_columns(["left", "cpu"], ["right", "mem"], left_width=8, gap=" | ")
+
+        self.assertEqual(output, ["left     | right", "cpu      | mem"])
+
+    def test_wide_system_panel_uses_side_by_side_subpanels(self):
+        lltop = load_lltop()
+        snapshot = self.sample_snapshot()
+        snapshot["system"].update(
+            {
+                "cpu_cores": [(str(index), 10 * index) for index in range(4)],
+                "mem": "Mem:            61Gi       8.2Gi       7.0Gi       123Mi        46Gi        53Gi",
+                "swap": "Swap: 8.0Gi 811Mi 7.2Gi",
+                "vmstat": "r 1 b 0 free 1 KiB in 2 cs 3 cpu 4u/5s/91i",
+                "iostat": "nvme0n1 r/s 1 w/s 2 read 3 KiB/s write 4 KiB/s util 5%",
+            }
+        )
+
+        output = lltop.render_snapshot(snapshot, width=140, height=40)
+
+        self.assertIn("+-- CPU ", output)
+        self.assertIn("+-- Memory / IO ", output)
+        system_header_line = next(line for line in output.splitlines() if "+-- CPU " in line)
+        self.assertIn("+-- Memory / IO ", system_header_line)
+        self.assertIn("Mem: 61Gi 8.2Gi 7.0Gi 123Mi 46Gi 53Gi", output)
+
+    def test_narrow_system_panel_uses_stacked_layout(self):
+        lltop = load_lltop()
+        snapshot = self.sample_snapshot()
+        snapshot["system"]["cpu_cores"] = [("0", 50), ("1", 20)]
+
+        output = lltop.render_snapshot(snapshot, width=100, height=32)
+
+        self.assertIn("+-- System ", output)
+        self.assertNotIn("+-- Memory / IO ", output)
 
 
 if __name__ == "__main__":

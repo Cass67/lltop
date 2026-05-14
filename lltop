@@ -83,6 +83,16 @@ def section(title: str, body: list[str], width: int) -> list[str]:
     return [header, *body, ""]
 
 
+def join_columns(left: list[str], right: list[str], left_width: int, gap: str = "   ") -> list[str]:
+    rows: list[str] = []
+    height = max(len(left), len(right))
+    for index in range(height):
+        left_text = left[index] if index < len(left) else ""
+        right_text = right[index] if index < len(right) else ""
+        rows.append(f"{left_text:<{left_width}}{gap}{right_text}")
+    return rows
+
+
 def active_clock(path: Path) -> str | None:
     value = read_text(path)
     if not value:
@@ -217,6 +227,10 @@ def summarize_vmstat(row: str) -> str:
     if len(parts) < 17:
         return row
     return f"r {parts[0]} b {parts[1]} free {parts[3]} KiB in {parts[10]} cs {parts[11]} cpu {parts[12]}u/{parts[13]}s/{parts[14]}i"
+
+
+def compact_free_row(row: str) -> str:
+    return " ".join(row.split())
 
 
 def parse_proc_stat(text: str) -> dict[str, list[int]]:
@@ -420,6 +434,39 @@ def render_cpu_cores(cores: list[tuple[str, int]], per_row: int = 4) -> list[str
     return lines
 
 
+def system_memory_io_lines(system: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for key in ("mem", "swap", "vmstat", "iostat"):
+        value = system.get(key)
+        if not value or value == "n/a":
+            continue
+        if key == "mem":
+            lines.append("  Memory columns: total used free shared buff/cache available")
+        if key == "swap":
+            lines.append("  Swap columns: total used free")
+        prefix = "  " if key in ("mem", "swap") else f"  {key}: "
+        if key in ("mem", "swap"):
+            value = compact_free_row(value)
+        lines.append(f"{prefix}{value}")
+    return lines
+
+
+def system_stacked_lines(system: dict[str, Any]) -> list[str]:
+    lines = [f"  load: {system.get('load', 'n/a')}"]
+    lines.extend(render_cpu_cores(system.get("cpu_cores") or []))
+    lines.extend(system_memory_io_lines(system))
+    return lines
+
+
+def system_side_by_side_lines(system: dict[str, Any], width: int) -> list[str]:
+    gap = "   "
+    left_width = min(64, max(50, (width - len(gap)) // 2))
+    right_width = max(40, width - left_width - len(gap))
+    cpu_block = section("CPU", [f"  load: {system.get('load', 'n/a')}", *render_cpu_cores(system.get("cpu_cores") or [], per_row=2)], left_width)[:-1]
+    memory_block = section("Memory / IO", system_memory_io_lines(system), right_width)[:-1]
+    return join_columns(cpu_block, memory_block, left_width, gap)
+
+
 def render_snapshot(snapshot: dict[str, Any], width: int | None = None, height: int | None = None) -> str:
     width = width or shutil.get_terminal_size((100, 30)).columns
     height = height or shutil.get_terminal_size((100, 30)).lines
@@ -463,18 +510,7 @@ def render_snapshot(snapshot: dict[str, Any], width: int | None = None, height: 
     lines.extend(section("llama.cpp", llama_lines, width))
 
     lines.extend(section("API", [f"  health: {api.get('health', 'n/a')}", f"  models: {api.get('models', 'n/a')}"], width))
-    system_lines = [f"  load: {system.get('load', 'n/a')}"]
-    system_lines.extend(render_cpu_cores(system.get("cpu_cores") or []))
-    for key in ("mem", "swap", "vmstat", "iostat"):
-        value = system.get(key)
-        if not value or value == "n/a":
-            continue
-        if key == "mem":
-            system_lines.append("  Memory columns: total used free shared buff/cache available")
-        if key == "swap":
-            system_lines.append("  Swap columns: total used free")
-        prefix = "  " if key in ("mem", "swap") else f"  {key}: "
-        system_lines.append(f"{prefix}{value}")
+    system_lines = system_side_by_side_lines(system, width) if width >= 120 else system_stacked_lines(system)
     lines.extend(section("System", system_lines, width))
     lines.extend(section("Recent log", [f"  {line}" for line in logs], width))
 
