@@ -21,6 +21,7 @@ from urllib.request import Request, urlopen
 DEFAULT_DRM_ROOT = Path("/sys/class/drm")
 DEFAULT_LLAMA_DIR = Path("/home/cass/llama.cpp")
 DEFAULT_BASE_URL = "http://127.0.0.1:8080"
+PROC_STAT = Path("/proc/stat")
 
 
 def read_text(path: Path) -> str | None:
@@ -218,6 +219,50 @@ def summarize_vmstat(row: str) -> str:
     return f"r {parts[0]} b {parts[1]} free {parts[3]} KiB in {parts[10]} cs {parts[11]} cpu {parts[12]}u/{parts[13]}s/{parts[14]}i"
 
 
+def parse_proc_stat(text: str) -> dict[str, list[int]]:
+    samples: dict[str, list[int]] = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts or not re.fullmatch(r"cpu\d+", parts[0]):
+            continue
+        try:
+            samples[parts[0]] = [int(value) for value in parts[1:]]
+        except ValueError:
+            continue
+    return samples
+
+
+def read_proc_stat(path: Path = PROC_STAT) -> dict[str, list[int]]:
+    text = read_text(path)
+    return parse_proc_stat(text or "")
+
+
+def cpu_percentages(before: dict[str, list[int]], after: dict[str, list[int]]) -> list[tuple[str, int]]:
+    percentages: list[tuple[str, int]] = []
+    for name in sorted(after, key=lambda value: int(value[3:])):
+        if name not in before:
+            continue
+        old = before[name]
+        new = after[name]
+        if len(old) < 4 or len(new) < 4:
+            continue
+        total_delta = sum(new) - sum(old)
+        idle_delta = (new[3] + (new[4] if len(new) > 4 else 0)) - (old[3] + (old[4] if len(old) > 4 else 0))
+        if total_delta <= 0:
+            percent = 0
+        else:
+            percent = int(round(((total_delta - idle_delta) / total_delta) * 100))
+        percentages.append((name[3:], int(clamp(percent, 0, 100))))
+    return percentages
+
+
+def collect_cpu_cores() -> list[tuple[str, int]]:
+    before = read_proc_stat()
+    time.sleep(0.1)
+    after = read_proc_stat()
+    return cpu_percentages(before, after)
+
+
 def collect_system() -> dict[str, str]:
     load = " ".join(f"{value:.2f}" for value in os.getloadavg())
     mem = run_command(["free", "-h"], timeout=1.0).splitlines()
@@ -229,6 +274,7 @@ def collect_system() -> dict[str, str]:
         "swap": mem[2] if len(mem) > 2 else "n/a",
         "vmstat": summarize_vmstat(vmstat[-1]) if vmstat else "n/a",
         "iostat": summarize_iostat(iostat[-1]) if iostat else "n/a",
+        "cpu_cores": collect_cpu_cores(),
     }
 
 
@@ -359,6 +405,21 @@ def style_attr(style: str) -> int:
     return attr
 
 
+def render_cpu_cores(cores: list[tuple[str, int]], per_row: int = 4) -> list[str]:
+    if not cores:
+        return []
+    lines = ["  CPU cores:"]
+    row: list[str] = []
+    for core, percent in cores:
+        row.append(f"{int(core):02d} {bar(percent, 10)} {percent}%")
+        if len(row) == per_row:
+            lines.append("  " + "  ".join(row))
+            row = []
+    if row:
+        lines.append("  " + "  ".join(row))
+    return lines
+
+
 def render_snapshot(snapshot: dict[str, Any], width: int | None = None, height: int | None = None) -> str:
     width = width or shutil.get_terminal_size((100, 30)).columns
     height = height or shutil.get_terminal_size((100, 30)).lines
@@ -403,10 +464,15 @@ def render_snapshot(snapshot: dict[str, Any], width: int | None = None, height: 
 
     lines.extend(section("API", [f"  health: {api.get('health', 'n/a')}", f"  models: {api.get('models', 'n/a')}"], width))
     system_lines = [f"  load: {system.get('load', 'n/a')}"]
+    system_lines.extend(render_cpu_cores(system.get("cpu_cores") or []))
     for key in ("mem", "swap", "vmstat", "iostat"):
         value = system.get(key)
         if not value or value == "n/a":
             continue
+        if key == "mem":
+            system_lines.append("  Memory columns: total used free shared buff/cache available")
+        if key == "swap":
+            system_lines.append("  Swap columns: total used free")
         prefix = "  " if key in ("mem", "swap") else f"  {key}: "
         system_lines.append(f"{prefix}{value}")
     lines.extend(section("System", system_lines, width))

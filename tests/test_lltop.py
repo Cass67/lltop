@@ -95,6 +95,19 @@ class LltopTests(unittest.TestCase):
 
         self.assertEqual(summary, "r 1 b 0 free 17758792 KiB in 4957 cs 5259 cpu 1u/2s/97i")
 
+    def test_cpu_percentages_from_proc_stat_samples(self):
+        lltop = load_lltop()
+        before = {
+            "cpu0": [100, 0, 100, 800, 0, 0, 0, 0, 0, 0],
+            "cpu1": [200, 0, 100, 700, 0, 0, 0, 0, 0, 0],
+        }
+        after = {
+            "cpu0": [150, 0, 150, 900, 0, 0, 0, 0, 0, 0],
+            "cpu1": [220, 0, 120, 860, 0, 0, 0, 0, 0, 0],
+        }
+
+        self.assertEqual(lltop.cpu_percentages(before, after), [("0", 50), ("1", 20)])
+
     def test_find_amd_gpu_device_reads_sysfs_metrics(self):
         lltop = load_lltop()
 
@@ -152,6 +165,20 @@ class LltopTests(unittest.TestCase):
         self.assertIn("+-- API ", output)
         self.assertIn("+-- System ", output)
         self.assertIn("+-- Recent log ", output)
+
+    def test_system_panel_shows_cpu_cores_and_memory_headers(self):
+        lltop = load_lltop()
+        snapshot = self.sample_snapshot()
+        snapshot["system"]["cpu_cores"] = [("0", 50), ("1", 20)]
+        snapshot["system"]["swap"] = "Swap: 8.0Gi 811Mi 7.2Gi"
+
+        output = lltop.render_snapshot(snapshot, width=100, height=32)
+
+        self.assertIn("CPU cores:", output)
+        self.assertIn("00 [#####-----] 50%", output)
+        self.assertIn("01 [##--------] 20%", output)
+        self.assertIn("Memory columns: total used free shared buff/cache available", output)
+        self.assertIn("Swap columns: total used free", output)
 
 
 if __name__ == "__main__":
