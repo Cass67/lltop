@@ -166,6 +166,49 @@ class LltopTests(unittest.TestCase):
 
         self.assertEqual(lltop.parse_last_eval_tps(lines), 50.0)
 
+    def test_newest_log_prefers_highest_timestamped_log_name(self):
+        lltop = load_lltop()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            older = root / "llama-20260524-120000.log"
+            newer = root / "llama-20260524-130000.log"
+            older.write_text("old\n")
+            newer.write_text("new\n")
+            older.touch()
+            newer.touch()
+            older.touch()
+
+            self.assertEqual(lltop.newest_log(root), newer)
+
+    def test_newest_log_finds_llama_speed_log(self):
+        lltop = load_lltop()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Create a dated log and llama-speed.log
+            dated = root / "llama-20260524-120000.log"
+            dated.write_text("dated\n")
+            dated.touch()
+            
+            speed = root / "llama-speed.log"
+            speed.write_text("speed\n")
+            
+            # newest_log should prefer dated log
+            self.assertEqual(lltop.newest_log(root), dated)
+
+    def test_newest_log_returns_llama_speed_when_only_speed_exists(self):
+        lltop = load_lltop()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Only create llama-speed.log
+            speed = root / "llama-speed.log"
+            speed.write_text("speed\n")
+            
+            # newest_log should return llama-speed.log
+            self.assertEqual(lltop.newest_log(root), speed)
+
     def test_find_amd_gpu_device_reads_sysfs_metrics(self):
         lltop = load_lltop()
 
@@ -234,6 +277,16 @@ class LltopTests(unittest.TestCase):
         self.assertIn("+-- API ", output)
         self.assertIn("+-- System ", output)
         self.assertIn("+-- Recent log ", output)
+
+    def test_render_snapshot_keeps_recent_log_visible_when_height_is_limited(self):
+        lltop = load_lltop()
+        snapshot = self.sample_snapshot()
+        snapshot["logs"] = [f"line {index}" for index in range(20)]
+
+        output = lltop.render_snapshot(snapshot, width=100, height=18)
+
+        self.assertIn("+-- Recent log ", output)
+        self.assertIn("line 19", output)
 
     def test_system_panel_shows_cpu_cores_and_memory_headers(self):
         lltop = load_lltop()

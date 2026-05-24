@@ -24,6 +24,13 @@ DEFAULT_LLAMA_DIR = Path("/home/cass/llama.cpp")
 DEFAULT_BASE_URL = "http://127.0.0.1:8080"
 PROC_STAT = Path("/proc/stat")
 
+# Common directories to search for llama log files
+LLAMA_LOG_SEARCH_PATHS = [
+    Path("/home/cass/llama.cpp"),  # Default location
+    Path.cwd(),                     # Current working directory
+    Path.home(),                    # User's home directory
+]
+
 
 def read_text(path: Path) -> str | None:
     try:
@@ -221,15 +228,13 @@ class TpsTracker:
             key = (int(slot["id"]), int(slot["task"]))
             decoded = int(slot["decoded"])
             current[key] = (decoded, sample_time)
-            if key not in self.previous:
-                continue
-            previous_decoded, previous_time = self.previous[key]
-            elapsed = sample_time - previous_time
-            delta = decoded - previous_decoded
-            if elapsed <= 0 or delta < 0:
-                continue
-            live_tps += delta / elapsed
-            has_sample = True
+            if key in self.previous:
+                previous_decoded, previous_time = self.previous[key]
+                elapsed = sample_time - previous_time
+                delta = decoded - previous_decoded
+                if elapsed > 0 and delta >= 0:
+                    live_tps += delta / elapsed
+                    has_sample = True
         self.previous = current
         return {
             "live_tps": round(live_tps, 1) if has_sample else None,
@@ -239,11 +244,26 @@ class TpsTracker:
 
 
 def parse_last_eval_tps(lines: list[str]) -> float | None:
-    pattern = re.compile(r"^\s*eval time\s*=.*?([0-9]+(?:\.[0-9]+)?) tokens per second\)")
+    # Pattern 1: "eval time = X tokens per second)" format (original llama.cpp)
+    pattern1 = re.compile(r"^\s*eval time\s*=.*?([0-9]+(?:\.[0-9]+)?) tokens per second\)")
+    # Pattern 2: "n_decoded = XXX, tg = XX.XX t/s" format (llama-speed.log)
+    pattern2 = re.compile(r"n_decoded\s*=\s*([0-9]+)\s*,\s*tg\s*=\s*([0-9.]+)\s*t/s")
+    
     for line in reversed(lines):
-        match = pattern.search(line)
-        if match:
-            return float(match.group(1))
+        # Try pattern 1 first
+        match1 = pattern1.search(line)
+        if match1:
+            return float(match1.group(1))
+        
+        # Try pattern 2
+        match2 = pattern2.search(line)
+        if match2:
+            n_decoded = int(match2.group(1))
+            tg = float(match2.group(2))
+            # TPS = n_decoded / tg (time in seconds)
+            if tg > 0:
+                return n_decoded / tg
+    
     return None
 
 
@@ -366,10 +386,33 @@ def collect_system() -> dict[str, str]:
 
 
 def newest_log(llama_dir: Path = DEFAULT_LLAMA_DIR) -> Path | None:
-    logs = list(llama_dir.glob("llama-*.log"))
-    if not logs:
-        return None
-    return max(logs, key=lambda path: path.stat().st_mtime)
+    # Patterns to match for llama log files
+    log_patterns = ["llama-*.log", "llama-speed.log"]
+    
+    # First, try the specified directory
+    for pattern in log_patterns:
+        logs = list(llama_dir.glob(pattern))
+        if logs:
+            if pattern == "llama-*.log":
+                dated_logs = [path for path in logs if re.fullmatch(r"llama-[0-9-]+\.log", path.name)]
+                if dated_logs:
+                    return max(dated_logs, key=lambda path: path.name)
+            return max(logs, key=lambda path: path.stat().st_mtime)
+    
+    # If no logs in specified dir, search in common directories
+    for search_dir in LLAMA_LOG_SEARCH_PATHS:
+        if search_dir == llama_dir:
+            continue  # Already checked
+        for pattern in log_patterns:
+            logs = list(search_dir.glob(pattern))
+            if logs:
+                if pattern == "llama-*.log":
+                    dated_logs = [path for path in logs if re.fullmatch(r"llama-[0-9-]+\.log", path.name)]
+                    if dated_logs:
+                        return max(dated_logs, key=lambda path: path.name)
+                return max(logs, key=lambda path: path.stat().st_mtime)
+    
+    return None
 
 
 def read_recent_logs(llama_dir: Path = DEFAULT_LLAMA_DIR, count: int = 8) -> list[str]:
@@ -614,7 +657,14 @@ def render_snapshot(snapshot: dict[str, Any], width: int | None = None, height: 
     lines.extend(section("API", [f"  health: {api.get('health', 'n/a')}", f"  models: {api.get('models', 'n/a')}"], width))
     system_lines = system_side_by_side_lines(system, width) if width >= 120 else system_stacked_lines(system)
     lines.extend(section("System", system_lines, width))
-    lines.extend(section("Recent log", [f"  {line}" for line in logs], width))
+    log_section = section("Recent log", [f"  {line}" for line in logs], width)
+    min_log_lines = min(len(log_section), 4)
+    if len(lines) + min_log_lines > height:
+        lines = lines[: max(0, height - min_log_lines)]
+    available_log_lines = max(0, height - len(lines))
+    if available_log_lines and len(log_section) > available_log_lines:
+        log_section = [log_section[0], *log_section[-(available_log_lines - 1) :]]
+    lines.extend(log_section)
 
     return "\n".join(single_line(line, width) for line in lines[:height])
 
