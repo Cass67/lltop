@@ -116,7 +116,8 @@ def first_glob(root: Path, pattern: str) -> Path | None:
     return Path(matches[0]) if matches else None
 
 
-def collect_gpu(drm_root: Path = DEFAULT_DRM_ROOT) -> dict[str, Any]:
+def collect_amd_gpus(drm_root: Path = DEFAULT_DRM_ROOT) -> list[dict[str, Any]]:
+    gpus: list[dict[str, Any]] = []
     for device in sorted(drm_root.glob("card*/device")):
         if read_text(device / "vendor") != "0x1002":
             continue
@@ -126,7 +127,9 @@ def collect_gpu(drm_root: Path = DEFAULT_DRM_ROOT) -> dict[str, Any]:
         temp_raw = read_int(temp_path) if temp_path else None
         power_raw = read_int(power_path) if power_path else None
 
-        return {
+        gpus.append({
+            "vendor": "AMD",
+            "name": "Radeon",
             "path": str(device),
             "gpu_busy_percent": read_int(device / "gpu_busy_percent"),
             "mem_busy_percent": read_int(device / "mem_busy_percent"),
@@ -138,7 +141,71 @@ def collect_gpu(drm_root: Path = DEFAULT_DRM_ROOT) -> dict[str, Any]:
             "power_w": power_raw / 1000000.0 if power_raw is not None else None,
             "sclk": active_clock(device / "pp_dpm_sclk"),
             "mclk": active_clock(device / "pp_dpm_mclk"),
-        }
+        })
+    return gpus
+
+
+def csv_int(value: str) -> int | None:
+    value = value.strip()
+    if not value or value == "[Not Supported]":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def csv_float(value: str) -> float | None:
+    value = value.strip()
+    if not value or value == "[Not Supported]":
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def mib_to_bytes(value: int | None) -> int | None:
+    return value * 1024 * 1024 if value is not None else None
+
+
+def collect_nvidia_gpus() -> list[dict[str, Any]]:
+    output = run_command(
+        [
+            "nvidia-smi",
+            "--query-gpu=name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,clocks.sm,clocks.mem",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    gpus: list[dict[str, Any]] = []
+    for index, line in enumerate(output.splitlines()):
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 9:
+            continue
+        memory_used = csv_int(parts[3])
+        memory_total = csv_int(parts[4])
+        sclk = csv_int(parts[7])
+        mclk = csv_int(parts[8])
+        gpus.append({
+            "vendor": "NVIDIA",
+            "name": parts[0],
+            "index": index,
+            "gpu_busy_percent": csv_int(parts[1]),
+            "mem_busy_percent": csv_int(parts[2]),
+            "vram_used": mib_to_bytes(memory_used),
+            "vram_total": mib_to_bytes(memory_total),
+            "temp_c": csv_float(parts[5]),
+            "power_w": csv_float(parts[6]),
+            "sclk": f"{sclk} MHz" if sclk is not None else None,
+            "mclk": f"{mclk} MHz" if mclk is not None else None,
+        })
+    return gpus
+
+
+def collect_gpu(drm_root: Path = DEFAULT_DRM_ROOT) -> dict[str, Any]:
+    gpus = [*collect_amd_gpus(drm_root), *collect_nvidia_gpus()]
+    if gpus:
+        return {"gpus": gpus}
     return {"error": f"no AMD GPU found under {drm_root}"}
 
 
@@ -625,20 +692,28 @@ def render_snapshot(snapshot: dict[str, Any], width: int | None = None, height: 
     if "error" in gpu:
         lines.extend(section("GPU", [f"  {gpu['error']}"], width))
     else:
-        gpu_busy = gpu.get("gpu_busy_percent")
-        mem_busy = gpu.get("mem_busy_percent")
-        vram_used = gpu.get("vram_used")
-        vram_total = gpu.get("vram_total")
-        temp = gpu.get("temp_c")
-        power = gpu.get("power_w")
+        gpu_lines: list[str] = []
+        for index, device in enumerate(gpu.get("gpus") or []):
+            gpu_busy = device.get("gpu_busy_percent")
+            mem_busy = device.get("mem_busy_percent")
+            vram_used = device.get("vram_used")
+            vram_total = device.get("vram_total")
+            temp = device.get("temp_c")
+            power = device.get("power_w")
+            label = f"{device.get('vendor', 'GPU')} {device.get('name', index)}"
+            location = device.get("path") or f"index {device.get('index', index)}"
+            if gpu_lines:
+                gpu_lines.append("")
+            gpu_lines.extend([
+                f"  {label} ({location})",
+                f"  Core {pct_text(gpu_busy):>5} {bar(gpu_busy)}   Mem busy {pct_text(mem_busy):>5} {bar(mem_busy)}",
+                f"  VRAM {format_bytes(vram_used)} / {format_bytes(vram_total)}   Temp {temp:.1f} C" if temp is not None else f"  VRAM {format_bytes(vram_used)} / {format_bytes(vram_total)}   Temp n/a",
+                f"  Power {power:.1f} W   SCLK {device.get('sclk') or 'n/a'}   MCLK {device.get('mclk') or 'n/a'}" if power is not None else f"  Power n/a   SCLK {device.get('sclk') or 'n/a'}   MCLK {device.get('mclk') or 'n/a'}",
+            ])
         lines.extend(
             section(
                 "GPU",
-                [
-                    f"  Core {pct_text(gpu_busy):>5} {bar(gpu_busy)}   Mem busy {pct_text(mem_busy):>5} {bar(mem_busy)}",
-                    f"  VRAM {format_bytes(vram_used)} / {format_bytes(vram_total)}   Temp {temp:.1f} C" if temp is not None else f"  VRAM {format_bytes(vram_used)} / {format_bytes(vram_total)}   Temp n/a",
-                    f"  Power {power:.1f} W   SCLK {gpu.get('sclk') or 'n/a'}   MCLK {gpu.get('mclk') or 'n/a'}" if power is not None else f"  Power n/a   SCLK {gpu.get('sclk') or 'n/a'}   MCLK {gpu.get('mclk') or 'n/a'}",
-                ],
+                gpu_lines or ["  no GPU metrics found"],
                 width,
             )
         )

@@ -1,12 +1,12 @@
 # lltop
 
-`lltop` is a terminal dashboard for watching a local `llama.cpp` server, AMD GPU usage, CPU cores, memory, disk IO, and recent llama logs from one screen.
+`lltop` is a terminal dashboard for watching a local `llama.cpp` server, GPU usage, CPU cores, memory, disk IO, and recent llama logs from one screen.
 
 It is built for the current `ubt26` llama.cpp setup, but the paths and API URL can be overridden with command-line options.
 
 ## Features
 
-- AMD GPU utilization, VRAM, memory busy, clocks, temperature, and power from `/sys/class/drm`.
+- AMD and NVIDIA GPU utilization, VRAM, memory busy, clocks, temperature, and power from `/sys/class/drm` and `nvidia-smi`.
 - `llama-server` PID, CPU usage, RSS, runtime, and launch command.
 - llama.cpp API health, model endpoint status, live tokens/sec from `/slots`, and last eval tokens/sec from logs.
 - Per-core CPU bars from `/proc/stat`.
@@ -17,9 +17,9 @@ It is built for the current `ubt26` llama.cpp setup, but the paths and API URL c
 ## Requirements
 
 - Linux with Python 3 and the standard library `curses` module.
-- AMD GPU sysfs metrics under `/sys/class/drm/card*/device`.
+- AMD GPU sysfs metrics under `/sys/class/drm/card*/device` or NVIDIA metrics from `nvidia-smi`.
 - `llama.cpp` logs in `/home/cass/llama.cpp` by default.
-- Optional system tools used when available: `free`, `vmstat`, `iostat`, `pgrep`, `ps`.
+- Optional system tools used when available: `free`, `vmstat`, `iostat`, `pgrep`, `ps`, `nvidia-smi`.
 - No third-party Python packages are required.
 
 ## Install

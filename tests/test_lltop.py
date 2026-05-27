@@ -25,15 +25,21 @@ class LltopTests(unittest.TestCase):
             "hostname": "ubt26",
             "time": "12:34:56",
             "gpu": {
-                "path": "/sys/class/drm/card2/device",
-                "gpu_busy_percent": 37,
-                "mem_busy_percent": 12,
-                "vram_used": 10729029632,
-                "vram_total": 21458059264,
-                "temp_c": 46.0,
-                "power_w": 10.0,
-                "sclk": "S: 2475Mhz *",
-                "mclk": "1: 1249Mhz *",
+                "gpus": [
+                    {
+                        "vendor": "AMD",
+                        "name": "Radeon",
+                        "path": "/sys/class/drm/card2/device",
+                        "gpu_busy_percent": 37,
+                        "mem_busy_percent": 12,
+                        "vram_used": 10729029632,
+                        "vram_total": 21458059264,
+                        "temp_c": 46.0,
+                        "power_w": 10.0,
+                        "sclk": "S: 2475Mhz *",
+                        "mclk": "1: 1249Mhz *",
+                    }
+                ],
             },
             "llama": {
                 "pid": "1234",
@@ -209,21 +215,28 @@ class LltopTests(unittest.TestCase):
             # newest_log should return llama-speed.log
             self.assertEqual(lltop.newest_log(root), speed)
 
-    def test_find_amd_gpu_device_reads_sysfs_metrics(self):
+    def test_collect_gpu_reads_all_amd_sysfs_devices(self):
         lltop = load_lltop()
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             intel = root / "card1" / "device"
             amd = root / "card2" / "device"
+            amd2 = root / "card3" / "device"
             intel.mkdir(parents=True)
             amd.mkdir(parents=True)
+            amd2.mkdir(parents=True)
             (intel / "vendor").write_text("0x8086\n")
             (amd / "vendor").write_text("0x1002\n")
+            (amd2 / "vendor").write_text("0x1002\n")
             (amd / "gpu_busy_percent").write_text("37\n")
             (amd / "mem_busy_percent").write_text("12\n")
             (amd / "mem_info_vram_total").write_text("21458059264\n")
             (amd / "mem_info_vram_used").write_text("10729029632\n")
+            (amd2 / "gpu_busy_percent").write_text("5\n")
+            (amd2 / "mem_busy_percent").write_text("2\n")
+            (amd2 / "mem_info_vram_total").write_text("8589934592\n")
+            (amd2 / "mem_info_vram_used").write_text("1073741824\n")
             hwmon = amd / "hwmon" / "hwmon4"
             hwmon.mkdir(parents=True)
             (hwmon / "temp1_input").write_text("46000\n")
@@ -231,13 +244,46 @@ class LltopTests(unittest.TestCase):
 
             gpu = lltop.collect_gpu(root)
 
-        self.assertEqual(gpu["path"], str(amd))
-        self.assertEqual(gpu["gpu_busy_percent"], 37)
-        self.assertEqual(gpu["mem_busy_percent"], 12)
-        self.assertEqual(gpu["vram_used"], 10729029632)
-        self.assertEqual(gpu["vram_total"], 21458059264)
-        self.assertEqual(gpu["temp_c"], 46.0)
-        self.assertEqual(gpu["power_w"], 10.0)
+        self.assertEqual(len(gpu["gpus"]), 2)
+        self.assertEqual(gpu["gpus"][0]["path"], str(amd))
+        self.assertEqual(gpu["gpus"][0]["vendor"], "AMD")
+        self.assertEqual(gpu["gpus"][0]["gpu_busy_percent"], 37)
+        self.assertEqual(gpu["gpus"][0]["mem_busy_percent"], 12)
+        self.assertEqual(gpu["gpus"][0]["vram_used"], 10729029632)
+        self.assertEqual(gpu["gpus"][0]["vram_total"], 21458059264)
+        self.assertEqual(gpu["gpus"][0]["temp_c"], 46.0)
+        self.assertEqual(gpu["gpus"][0]["power_w"], 10.0)
+        self.assertEqual(gpu["gpus"][1]["path"], str(amd2))
+        self.assertEqual(gpu["gpus"][1]["gpu_busy_percent"], 5)
+
+    def test_collect_nvidia_gpus_parses_nvidia_smi_csv(self):
+        lltop = load_lltop()
+        original_run_command = lltop.run_command
+        try:
+            lltop.run_command = lambda *args, **kwargs: "Tesla P40, 83, 21, 1024, 22919, 62, 94.50, 1328, 3615"
+
+            gpus = lltop.collect_nvidia_gpus()
+        finally:
+            lltop.run_command = original_run_command
+
+        self.assertEqual(
+            gpus,
+            [
+                {
+                    "vendor": "NVIDIA",
+                    "name": "Tesla P40",
+                    "index": 0,
+                    "gpu_busy_percent": 83,
+                    "mem_busy_percent": 21,
+                    "vram_used": 1073741824,
+                    "vram_total": 24032313344,
+                    "temp_c": 62.0,
+                    "power_w": 94.5,
+                    "sclk": "1328 MHz",
+                    "mclk": "3615 MHz",
+                }
+            ],
+        )
 
     def test_render_snapshot_contains_gpu_llama_api_and_logs(self):
         lltop = load_lltop()
@@ -255,6 +301,32 @@ class LltopTests(unittest.TestCase):
         self.assertIn("qwen3-coder", output)
         self.assertIn("Recent log", output)
         self.assertIn("slot 0 idle", output)
+
+    def test_render_snapshot_shows_amd_and_nvidia_gpus(self):
+        lltop = load_lltop()
+        snapshot = self.sample_snapshot()
+        snapshot["gpu"]["gpus"].append(
+            {
+                "vendor": "NVIDIA",
+                "name": "Tesla P40",
+                "index": 0,
+                "gpu_busy_percent": 83,
+                "mem_busy_percent": 21,
+                "vram_used": 1073741824,
+                "vram_total": 24032313344,
+                "temp_c": 62.0,
+                "power_w": 94.5,
+                "sclk": "1328 MHz",
+                "mclk": "3615 MHz",
+            }
+        )
+
+        output = lltop.render_snapshot(snapshot, width=120, height=32)
+
+        self.assertIn("AMD Radeon", output)
+        self.assertIn("NVIDIA Tesla P40", output)
+        self.assertIn("83%", output)
+        self.assertIn("1.0 GiB / 22.4 GiB", output)
 
     def test_llama_panel_shows_token_throughput(self):
         lltop = load_lltop()
