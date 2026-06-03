@@ -2,7 +2,7 @@
 
 `lltop` is a terminal dashboard for watching a local `llama.cpp` server, GPU usage, CPU cores, memory, disk I/O, and recent model logs.
 
-It is built for the `ubt26` style setup but can be pointed at other `llama.cpp` directories and API URLs.
+It pairs well with [`local_llm`](https://github.com/cass67/local_llm), which can generate `llama.cpp` launchers that write the `model.log` file shown in the Recent log panel.
 
 ## Features
 
@@ -52,10 +52,10 @@ One-shot snapshot:
 lltop --once
 ```
 
-Run on `ubt26` over SSH:
+Run on a remote model host over SSH:
 
 ```bash
-ssh -t ubt26 '~/.local/bin/lltop'
+ssh -t <host> '~/.local/bin/lltop'
 ```
 
 ## Options
@@ -76,12 +76,12 @@ ssh -t ubt26 '~/.local/bin/lltop'
 ~/llama.cpp/model.log
 ```
 
-That file is written by current `local_llm` generated launchers. If `model.log` is missing, `lltop` falls back to older `llama-*.log` files so older setups still show logs.
+That file is written by current [`local_llm`](https://github.com/cass67/local_llm) generated launchers. If `model.log` is missing, `lltop` falls back to older `llama-*.log` files so older setups still show logs.
 
-If the Recent log panel still shows an old `llama-*.log`, restart the model service after updating launchers:
+If the Recent log panel still shows an old `llama-*.log`, update/redeploy your `local_llm` launchers and restart the model service on the host:
 
 ```bash
-ssh ubt26 'systemctl --user restart llama-server.service'
+ssh <host> 'systemctl --user restart llama-server.service'
 ```
 
 ## Development
