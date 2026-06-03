@@ -172,6 +172,20 @@ class LltopTests(unittest.TestCase):
 
         self.assertEqual(lltop.parse_last_eval_tps(lines), 50.0)
 
+    def test_newest_log_prefers_model_log_over_legacy_logs(self):
+        lltop = load_lltop()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = root / "model.log"
+            legacy = root / "llama-20260524-130000.log"
+            model.write_text("current model\n")
+            legacy.write_text("old model\n")
+            legacy.touch()
+            model.touch()
+
+            self.assertEqual(lltop.newest_log(root), model)
+
     def test_newest_log_prefers_highest_timestamped_log_name(self):
         lltop = load_lltop()
 
@@ -214,6 +228,14 @@ class LltopTests(unittest.TestCase):
             
             # newest_log should return llama-speed.log
             self.assertEqual(lltop.newest_log(root), speed)
+
+    def test_read_recent_logs_missing_mentions_model_log(self):
+        lltop = load_lltop()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            self.assertEqual(lltop.read_recent_logs(root), [f"no model.log or llama-*.log files found in {root}"])
 
     def test_collect_gpu_reads_all_amd_sysfs_devices(self):
         lltop = load_lltop()

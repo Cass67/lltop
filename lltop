@@ -453,10 +453,10 @@ def collect_system() -> dict[str, str]:
 
 
 def newest_log(llama_dir: Path = DEFAULT_LLAMA_DIR) -> Path | None:
-    # Patterns to match for llama log files
-    log_patterns = ["llama-*.log", "llama-speed.log"]
-    
-    # First, try the specified directory
+    log_patterns = ["model.log", "llama-*.log", "llama-speed.log"]
+
+    # First, try the specified directory. model.log is the stable current-run log;
+    # legacy llama-*.log files stay as fallback for older launchers.
     for pattern in log_patterns:
         logs = list(llama_dir.glob(pattern))
         if logs:
@@ -465,7 +465,7 @@ def newest_log(llama_dir: Path = DEFAULT_LLAMA_DIR) -> Path | None:
                 if dated_logs:
                     return max(dated_logs, key=lambda path: path.name)
             return max(logs, key=lambda path: path.stat().st_mtime)
-    
+
     # If no logs in specified dir, search in common directories
     for search_dir in LLAMA_LOG_SEARCH_PATHS:
         if search_dir == llama_dir:
@@ -478,14 +478,14 @@ def newest_log(llama_dir: Path = DEFAULT_LLAMA_DIR) -> Path | None:
                     if dated_logs:
                         return max(dated_logs, key=lambda path: path.name)
                 return max(logs, key=lambda path: path.stat().st_mtime)
-    
+
     return None
 
 
 def read_recent_logs(llama_dir: Path = DEFAULT_LLAMA_DIR, count: int = 8) -> list[str]:
     log = newest_log(llama_dir)
     if log is None:
-        return [f"no llama-*.log files found in {llama_dir}"]
+        return [f"no model.log or llama-*.log files found in {llama_dir}"]
     try:
         lines = log.read_text(errors="replace").splitlines()
     except OSError as exc:

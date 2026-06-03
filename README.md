@@ -11,14 +11,14 @@ It is built for the current `ubt26` llama.cpp setup, but the paths and API URL c
 - llama.cpp API health, model endpoint status, live tokens/sec from `/slots`, and last eval tokens/sec from logs.
 - Per-core CPU bars from `/proc/stat`.
 - Memory, swap, `vmstat`, and `iostat` summaries.
-- Recent `llama-*.log` lines from the llama.cpp directory.
+- Recent `model.log` lines from the llama.cpp directory, with legacy `llama-*.log` fallback.
 - Bashtop-style colored `curses` UI with a plain `--once` output mode.
 
 ## Requirements
 
 - Linux with Python 3 and the standard library `curses` module.
 - AMD GPU sysfs metrics under `/sys/class/drm/card*/device` or NVIDIA metrics from `nvidia-smi`.
-- `llama.cpp` logs in `/home/cass/llama.cpp` by default.
+- `llama.cpp` `model.log` in `/home/cass/llama.cpp` by default.
 - Optional system tools used when available: `free`, `vmstat`, `iostat`, `pgrep`, `ps`, `nvidia-smi`.
 - No third-party Python packages are required.
 
@@ -82,7 +82,7 @@ ssh ubt26 '~/.local/bin/lltop --once'
 --once              print one dashboard snapshot and exit
 --interval SECONDS  refresh interval, default: 1.0
 --drm-root PATH     DRM sysfs root, default: /sys/class/drm
---llama-dir PATH    llama.cpp directory containing llama-*.log, default: /home/cass/llama.cpp
+--llama-dir PATH    llama.cpp directory containing model.log, default: /home/cass/llama.cpp
 --base-url URL      llama.cpp server base URL, default: http://127.0.0.1:8080
 ```
 
