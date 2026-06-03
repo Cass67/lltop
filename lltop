@@ -778,7 +778,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--once", action="store_true", help="print one dashboard snapshot and exit")
     parser.add_argument("--interval", type=float, default=1.0, help="refresh interval in seconds")
     parser.add_argument("--drm-root", type=Path, default=DEFAULT_DRM_ROOT, help="DRM sysfs root")
-    parser.add_argument("--llama-dir", type=Path, default=DEFAULT_LLAMA_DIR, help="llama.cpp directory containing llama-*.log")
+    parser.add_argument("--llama-dir", type=Path, default=DEFAULT_LLAMA_DIR, help="llama.cpp directory containing model.log")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="llama.cpp server base URL")
     return parser.parse_args(argv)
 
