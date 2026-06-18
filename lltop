@@ -116,7 +116,18 @@ def first_glob(root: Path, pattern: str) -> Path | None:
 def _lspci_name(pci_id: str) -> str:
     out = run_command(["lspci", "-s", pci_id], timeout=2.0)
     m = re.search(r"(?:VGA|Display|3D)[^:]*:\s*(.+?)(?:\s*\(rev|\s*$)", out)
-    return m.group(1).strip() if m else ""
+    if not m:
+        return ""
+    name = m.group(1).strip()
+    # Prefer the last bracketed term (marketing name e.g. "[Radeon RX 7900 XT/7900 XTX/...]")
+    bracket = re.findall(r"\[([^\]]+)\]", name)
+    if bracket:
+        # Take first slash-variant only
+        name = bracket[-1].split("/")[0].strip()
+    else:
+        # No brackets: strip vendor prefix and take what remains
+        name = re.sub(r"^Advanced Micro Devices[^A-Z]*", "", name).strip()
+    return name
 
 
 def collect_amd_gpus(drm_root: Path = DEFAULT_DRM_ROOT) -> list[dict[str, Any]]:
