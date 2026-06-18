@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live llama.cpp and AMD GPU monitor for ubt26."""
+"""Live monitor for local_llm containers — mixed AMD/NVIDIA, multi-cluster."""
 
 from __future__ import annotations
 
@@ -20,17 +20,12 @@ from urllib.request import Request, urlopen
 
 
 DEFAULT_DRM_ROOT = Path("/sys/class/drm")
-DEFAULT_LLAMA_DIR = Path("/home/cass/llama.cpp")
-DEFAULT_BASE_URL = "http://127.0.0.1:8080"
+DEFAULT_STATE_DIR = Path.home() / ".local/share/local_llm"
+DEFAULT_DOCKER_SOCKET = Path("/var/run/docker.sock")
 PROC_STAT = Path("/proc/stat")
 
-# Common directories to search for llama log files
-LLAMA_LOG_SEARCH_PATHS = [
-    Path("/home/cass/llama.cpp"),  # Default location
-    Path.cwd(),                     # Current working directory
-    Path.home(),                    # User's home directory
-]
 
+# ── sysfs helpers ────────────────────────────────────────────────────────────
 
 def read_text(path: Path) -> str | None:
     try:
@@ -116,29 +111,42 @@ def first_glob(root: Path, pattern: str) -> Path | None:
     return Path(matches[0]) if matches else None
 
 
+# ── GPU collection ────────────────────────────────────────────────────────────
+
 def collect_amd_gpus(drm_root: Path = DEFAULT_DRM_ROOT) -> list[dict[str, Any]]:
     gpus: list[dict[str, Any]] = []
     for device in sorted(drm_root.glob("card*/device")):
         if read_text(device / "vendor") != "0x1002":
             continue
 
-        temp_path = first_glob(device, "hwmon/hwmon*/temp1_input")
-        power_path = first_glob(device, "hwmon/hwmon*/power1_average")
-        temp_raw = read_int(temp_path) if temp_path else None
-        power_raw = read_int(power_path) if power_path else None
+        hwmon = first_glob(device, "hwmon/hwmon*")
+        temp_raw = read_int(hwmon / "temp1_input") if hwmon else None       # edge
+        junction_raw = read_int(hwmon / "temp2_input") if hwmon else None   # junction
+        power_raw = read_int(hwmon / "power1_average") if hwmon else None
+        fan_rpm = read_int(hwmon / "fan1_input") if hwmon else None
+        pwm = read_int(hwmon / "pwm1") if hwmon else None
+        fan_pct = round(pwm / 255.0 * 100) if pwm is not None else None
+
+        # PCI id for cluster correlation
+        try:
+            pci_id = device.resolve().name
+        except OSError:
+            pci_id = device.parts[-2]  # cardN
 
         gpus.append({
             "vendor": "AMD",
             "name": "Radeon",
             "path": str(device),
+            "pci_id": pci_id,
             "gpu_busy_percent": read_int(device / "gpu_busy_percent"),
             "mem_busy_percent": read_int(device / "mem_busy_percent"),
             "vram_used": read_int(device / "mem_info_vram_used"),
             "vram_total": read_int(device / "mem_info_vram_total"),
-            "vis_vram_used": read_int(device / "mem_info_vis_vram_used"),
-            "vis_vram_total": read_int(device / "mem_info_vis_vram_total"),
             "temp_c": temp_raw / 1000.0 if temp_raw is not None else None,
+            "junction_temp_c": junction_raw / 1000.0 if junction_raw is not None else None,
             "power_w": power_raw / 1000000.0 if power_raw is not None else None,
+            "fan_rpm": fan_rpm,
+            "fan_pct": fan_pct,
             "sclk": active_clock(device / "pp_dpm_sclk"),
             "mclk": active_clock(device / "pp_dpm_mclk"),
         })
@@ -173,29 +181,37 @@ def collect_nvidia_gpus() -> list[dict[str, Any]]:
     output = run_command(
         [
             "nvidia-smi",
-            "--query-gpu=name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,clocks.sm,clocks.mem",
+            "--query-gpu=name,pci.bus_id,utilization.gpu,utilization.memory,"
+            "memory.used,memory.total,temperature.gpu,power.draw,"
+            "clocks.sm,clocks.mem,fan.speed",
             "--format=csv,noheader,nounits",
         ]
     )
     gpus: list[dict[str, Any]] = []
     for index, line in enumerate(output.splitlines()):
         parts = [part.strip() for part in line.split(",")]
-        if len(parts) != 9:
+        if len(parts) != 11:
             continue
-        memory_used = csv_int(parts[3])
-        memory_total = csv_int(parts[4])
-        sclk = csv_int(parts[7])
-        mclk = csv_int(parts[8])
+        memory_used = csv_int(parts[4])
+        memory_total = csv_int(parts[5])
+        sclk = csv_int(parts[8])
+        mclk = csv_int(parts[9])
+        fan = csv_int(parts[10])
+        # Normalize PCI id: strip leading domain (00000000:) → 0000:03:00.0
+        pci_raw = parts[1].strip().lower()
+        pci_id = re.sub(r"^[0-9a-f]{8}:", "", pci_raw)
         gpus.append({
             "vendor": "NVIDIA",
             "name": parts[0],
             "index": index,
-            "gpu_busy_percent": csv_int(parts[1]),
-            "mem_busy_percent": csv_int(parts[2]),
+            "pci_id": pci_id,
+            "gpu_busy_percent": csv_int(parts[2]),
+            "mem_busy_percent": csv_int(parts[3]),
             "vram_used": mib_to_bytes(memory_used),
             "vram_total": mib_to_bytes(memory_total),
-            "temp_c": csv_float(parts[5]),
-            "power_w": csv_float(parts[6]),
+            "temp_c": csv_float(parts[6]),
+            "power_w": csv_float(parts[7]),
+            "fan_pct": fan,
             "sclk": f"{sclk} MHz" if sclk is not None else None,
             "mclk": f"{mclk} MHz" if mclk is not None else None,
         })
@@ -206,8 +222,10 @@ def collect_gpu(drm_root: Path = DEFAULT_DRM_ROOT) -> dict[str, Any]:
     gpus = [*collect_amd_gpus(drm_root), *collect_nvidia_gpus()]
     if gpus:
         return {"gpus": gpus}
-    return {"error": f"no AMD GPU found under {drm_root}"}
+    return {"error": f"no GPUs found (checked AMD sysfs under {drm_root} and nvidia-smi)"}
 
+
+# ── subprocess helper ─────────────────────────────────────────────────────────
 
 def run_command(args: list[str], timeout: float = 1.0) -> str:
     try:
@@ -224,27 +242,121 @@ def run_command(args: list[str], timeout: float = 1.0) -> str:
     return result.stdout.strip()
 
 
-def collect_llama_process() -> dict[str, str] | None:
-    pgrep = run_command(["pgrep", "-f", "[l]lama-server"])
-    pids = [pid for pid in pgrep.splitlines() if pid.strip()]
-    if not pids:
-        return None
-    pid = pids[0]
-    output = run_command(["ps", "-p", pid, "-o", "pid=,%cpu=,rss=,etime=,args="], timeout=1.0)
-    if not output:
-        return {"pid": pid, "cpu_percent": "n/a", "rss": "n/a", "etime": "n/a", "cmd": "n/a"}
-    parts = output.split(None, 4)
-    if len(parts) < 5:
-        return {"pid": pid, "cpu_percent": "n/a", "rss": "n/a", "etime": "n/a", "cmd": output}
-    rss_bytes = int(parts[2]) * 1024 if parts[2].isdigit() else None
-    return {
-        "pid": parts[0],
-        "cpu_percent": parts[1],
-        "rss": format_bytes(rss_bytes),
-        "etime": parts[3],
-        "cmd": parts[4],
-    }
+# ── Docker helpers ────────────────────────────────────────────────────────────
 
+class _UnixHTTPConn(socket.socket):
+    pass
+
+
+def _docker_request(socket_path: Path, method: str, path: str) -> bytes:
+    """Make a raw HTTP/1.0 request to the Docker socket, return response body."""
+    if not socket_path.exists():
+        return b""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(2.0)
+        sock.connect(str(socket_path))
+        request = f"{method} {path} HTTP/1.0\r\nHost: localhost\r\n\r\n"
+        sock.sendall(request.encode())
+        chunks: list[bytes] = []
+        while True:
+            try:
+                chunk = sock.recv(65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        sock.close()
+    raw = b"".join(chunks)
+    # Strip HTTP headers
+    if b"\r\n\r\n" in raw:
+        return raw.split(b"\r\n\r\n", 1)[1]
+    return raw
+
+
+def _decode_docker_log_bytes(content: bytes) -> str:
+    """Decode Docker multiplexed log stream (stdcopy format)."""
+    chunks: list[bytes] = []
+    index = 0
+    while index + 8 <= len(content) and content[index] in (0, 1, 2):
+        size = int.from_bytes(content[index + 4: index + 8], "big")
+        start = index + 8
+        end = start + size
+        if size < 0 or end > len(content):
+            break
+        chunks.append(content[start:end])
+        index = end
+    if chunks and index == len(content):
+        return b"".join(chunks).decode("utf-8", errors="replace")
+    return content.decode("utf-8", errors="replace")
+
+
+def docker_log_tail(socket_path: Path, container: str, lines: int = 10) -> list[str]:
+    if not socket_path.exists():
+        return [f"docker socket not found: {socket_path}"]
+    path = f"/containers/{container}/logs?stdout=1&stderr=1&tail={lines}&timestamps=0"
+    raw = _docker_request(socket_path, "GET", path)
+    if not raw:
+        return []
+    text = _decode_docker_log_bytes(raw)
+    return [line for line in text.splitlines() if '"GET /logs HTTP/1.1"' not in line]
+
+
+def docker_container_running(socket_path: Path, container: str) -> bool:
+    if not socket_path.exists():
+        return False
+    raw = _docker_request(socket_path, "GET", f"/containers/{container}/json")
+    if not raw:
+        return False
+    try:
+        data = json.loads(raw)
+        state = data.get("State") if isinstance(data, dict) else None
+        return bool(isinstance(state, dict) and state.get("Running"))
+    except (json.JSONDecodeError, AttributeError):
+        return False
+
+
+# ── local_llm state readers ───────────────────────────────────────────────────
+
+def _read_json_dir(directory: Path) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    if not directory.exists():
+        return result
+    for f in sorted(directory.glob("*.json")):
+        try:
+            data = json.loads(f.read_text())
+            if isinstance(data, dict):
+                result.append(data)
+        except (OSError, json.JSONDecodeError):
+            continue
+    return result
+
+
+def collect_runners(state_dir: Path, socket_path: Path) -> list[dict[str, Any]]:
+    """Read active runner state from local_llm state dir + check Docker status."""
+    active = _read_json_dir(state_dir / "runs" / "active")
+    runners: list[dict[str, Any]] = []
+    for entry in active:
+        container = str(entry.get("container") or "")
+        running = docker_container_running(socket_path, container) if container else False
+        runners.append({
+            "cluster_id": str(entry.get("cluster_id") or ""),
+            "cluster_name": str(entry.get("cluster_name") or ""),
+            "model": str(entry.get("model") or entry.get("family") or "unknown"),
+            "family": str(entry.get("family") or ""),
+            "label": entry.get("label"),
+            "backend": str(entry.get("backend") or ""),
+            "port": int(entry.get("port") or 8080),
+            "container": container,
+            "gpu_pci_ids": list(entry.get("gpu_pci_ids") or []),
+            "running": running,
+        })
+    return runners
+
+
+# ── HTTP / API ────────────────────────────────────────────────────────────────
 
 def http_json_or_text(url: str, timeout: float = 0.8, max_bytes: int = 4096) -> str:
     request = Request(url, headers={"Accept": "application/json"})
@@ -310,30 +422,6 @@ class TpsTracker:
         }
 
 
-def parse_last_eval_tps(lines: list[str]) -> float | None:
-    # Pattern 1: "eval time = X tokens per second)" format (original llama.cpp)
-    pattern1 = re.compile(r"^\s*eval time\s*=.*?([0-9]+(?:\.[0-9]+)?) tokens per second\)")
-    # Pattern 2: "n_decoded = XXX, tg = XX.XX t/s" format (llama-speed.log)
-    pattern2 = re.compile(r"n_decoded\s*=\s*([0-9]+)\s*,\s*tg\s*=\s*([0-9.]+)\s*t/s")
-    
-    for line in reversed(lines):
-        # Try pattern 1 first
-        match1 = pattern1.search(line)
-        if match1:
-            return float(match1.group(1))
-        
-        # Try pattern 2
-        match2 = pattern2.search(line)
-        if match2:
-            n_decoded = int(match2.group(1))
-            tg = float(match2.group(2))
-            # TPS = n_decoded / tg (time in seconds)
-            if tg > 0:
-                return n_decoded / tg
-    
-    return None
-
-
 def summarize_models(models_body: str) -> str:
     if models_body.startswith("unreachable:"):
         return models_body
@@ -344,9 +432,9 @@ def summarize_models(models_body: str) -> str:
     rest = models_body
     while marker in rest and len(ids) < 3:
         rest = rest.split(marker, 1)[1]
-        if ':' not in rest:
+        if ":" not in rest:
             break
-        rest = rest.split(':', 1)[1].lstrip()
+        rest = rest.split(":", 1)[1].lstrip()
         if not rest.startswith('"'):
             continue
         rest = rest[1:]
@@ -356,18 +444,19 @@ def summarize_models(models_body: str) -> str:
     return ", ".join(ids) if ids else models_body[:120]
 
 
-def collect_api(base_url: str = DEFAULT_BASE_URL) -> dict[str, str]:
-    health = http_json_or_text(f"{base_url}/health")
-    models = summarize_models(http_json_or_text(f"{base_url}/v1/models"))
-    return {"health": health, "models": models}
+def collect_runner_api(port: int, tracker: TpsTracker) -> dict[str, Any]:
+    base = f"http://127.0.0.1:{port}"
+    health = http_json_or_text(f"{base}/health")
+    models = summarize_models(http_json_or_text(f"{base}/v1/models"))
+    slots_body = http_json_or_text(f"{base}/slots", max_bytes=1024 * 1024)
+    if slots_body.startswith("unreachable:"):
+        tps: dict[str, Any] = {"live_tps": None, "active_slots": "n/a", "total_slots": "n/a"}
+    else:
+        tps = tracker.update(parse_slots(slots_body))
+    return {"health": health, "models": models, "tps": tps}
 
 
-def collect_slots(base_url: str = DEFAULT_BASE_URL) -> list[dict[str, Any]] | None:
-    body = http_json_or_text(f"{base_url}/slots", max_bytes=1024 * 1024)
-    if body.startswith("unreachable:"):
-        return None
-    return parse_slots(body)
-
+# ── system metrics ────────────────────────────────────────────────────────────
 
 def summarize_iostat(row: str) -> str:
     parts = row.split()
@@ -452,87 +541,57 @@ def collect_system() -> dict[str, str]:
     }
 
 
-def newest_log(llama_dir: Path = DEFAULT_LLAMA_DIR) -> Path | None:
-    log_patterns = ["model.log", "llama-*.log", "llama-speed.log"]
-
-    # First, try the specified directory. model.log is the stable current-run log;
-    # legacy llama-*.log files stay as fallback for older launchers.
-    for pattern in log_patterns:
-        logs = list(llama_dir.glob(pattern))
-        if logs:
-            if pattern == "llama-*.log":
-                dated_logs = [path for path in logs if re.fullmatch(r"llama-[0-9-]+\.log", path.name)]
-                if dated_logs:
-                    return max(dated_logs, key=lambda path: path.name)
-            return max(logs, key=lambda path: path.stat().st_mtime)
-
-    # If no logs in specified dir, search in common directories
-    for search_dir in LLAMA_LOG_SEARCH_PATHS:
-        if search_dir == llama_dir:
-            continue  # Already checked
-        for pattern in log_patterns:
-            logs = list(search_dir.glob(pattern))
-            if logs:
-                if pattern == "llama-*.log":
-                    dated_logs = [path for path in logs if re.fullmatch(r"llama-[0-9-]+\.log", path.name)]
-                    if dated_logs:
-                        return max(dated_logs, key=lambda path: path.name)
-                return max(logs, key=lambda path: path.stat().st_mtime)
-
-    return None
-
-
-def read_recent_logs(llama_dir: Path = DEFAULT_LLAMA_DIR, count: int = 8) -> list[str]:
-    log = newest_log(llama_dir)
-    if log is None:
-        return [f"no model.log or llama-*.log files found in {llama_dir}"]
-    try:
-        lines = log.read_text(errors="replace").splitlines()
-    except OSError as exc:
-        return [f"failed to read {log}: {exc}"]
-    if not lines:
-        return [f"{log.name}: empty"]
-    return [f"{log.name}: {line}" for line in lines[-count:]]
-
-
-def read_last_eval_tps(llama_dir: Path = DEFAULT_LLAMA_DIR) -> float | None:
-    log = newest_log(llama_dir)
-    if log is None:
-        return None
-    try:
-        lines = log.read_text(errors="replace").splitlines()
-    except OSError:
-        return None
-    return parse_last_eval_tps(lines)
-
-
-def collect_tps(base_url: str, llama_dir: Path, tracker: TpsTracker | None) -> dict[str, Any]:
-    slots = collect_slots(base_url)
-    if slots is None:
-        slot_stats = {"live_tps": None, "active_slots": "n/a", "total_slots": "n/a"}
-    else:
-        slot_stats = tracker.update(slots) if tracker is not None else TpsTracker().update(slots)
-    slot_stats["last_eval_tps"] = read_last_eval_tps(llama_dir)
-    return slot_stats
-
+# ── snapshot ──────────────────────────────────────────────────────────────────
 
 def collect_snapshot(
-    drm_root: Path = DEFAULT_DRM_ROOT,
-    llama_dir: Path = DEFAULT_LLAMA_DIR,
-    base_url: str = DEFAULT_BASE_URL,
-    tps_tracker: TpsTracker | None = None,
+    drm_root: Path,
+    state_dir: Path,
+    socket_path: Path,
+    tps_trackers: dict[int, TpsTracker],
 ) -> dict[str, Any]:
+    runners = collect_runners(state_dir, socket_path)
+
+    # Per-runner API + TPS (only for running containers)
+    for runner in runners:
+        if runner["running"]:
+            port = runner["port"]
+            if port not in tps_trackers:
+                tps_trackers[port] = TpsTracker()
+            runner["api"] = collect_runner_api(port, tps_trackers[port])
+        else:
+            runner["api"] = {"health": "stopped", "models": "n/a", "tps": {}}
+
+    # Collect logs from running containers (last 10 lines each, up to 2 containers)
+    logs: list[str] = []
+    for runner in runners:
+        if runner["running"] and runner["container"]:
+            label = runner.get("cluster_name") or runner["container"][-20:]
+            lines = docker_log_tail(socket_path, runner["container"], lines=10)
+            if lines:
+                logs.append(f"[{label}]")
+                logs.extend(lines)
+    if not logs:
+        logs = ["no running containers"]
+
     return {
-        "hostname": socket.gethostname(),
+        "hostname": _hostname(),
         "time": time.strftime("%H:%M:%S"),
         "gpu": collect_gpu(drm_root),
-        "llama": collect_llama_process(),
-        "tps": collect_tps(base_url, llama_dir, tps_tracker),
-        "api": collect_api(base_url),
+        "runners": runners,
         "system": collect_system(),
-        "logs": read_recent_logs(llama_dir),
+        "logs": logs,
     }
 
+
+def _hostname() -> str:
+    import socket as _socket
+    try:
+        return _socket.gethostname()
+    except OSError:
+        return "unknown"
+
+
+# ── rendering ─────────────────────────────────────────────────────────────────
 
 def pct_text(value: int | float | None) -> str:
     return "n/a" if value is None else f"{value}%"
@@ -556,15 +615,17 @@ def line_style(line: str) -> str:
         return "header"
     if line.startswith("+-- "):
         return "panel"
-    if any(word in lower for word in ("unreachable", "error", "failed")):
+    if any(word in lower for word in ("unreachable", "error", "failed", "stopped")):
         return "bad"
-    if lower.startswith("health:") or lower.startswith("models:"):
+    if lower.startswith("health:") or lower.startswith("models:") or lower.startswith("  health:"):
         return "good"
+    if stripped.startswith("[") and stripped.endswith("]"):
+        return "muted"
     percent_values = [int(match) for match in re.findall(r"(\d+)%", line)]
     if percent_values:
         return meter_style(max(percent_values))
-    if stripped.startswith("./") or stripped.startswith("llama-"):
-        return "muted"
+    if stripped.startswith("running") or "running" in lower[:20]:
+        return "good"
     return "normal"
 
 
@@ -601,7 +662,9 @@ def init_colors() -> None:
     }
     for pair_number, style in enumerate(style_palette().values(), start=1):
         foreground = color_numbers[style["foreground"]]
-        pair_background = background if style["background"] == "default" else color_numbers[style["background"]]
+        pair_background = (
+            background if style["background"] == "default" else color_numbers[style["background"]]
+        )
         try:
             curses.init_pair(pair_number, foreground, pair_background)
         except curses.error:
@@ -671,91 +734,160 @@ def system_stacked_lines(system: dict[str, Any]) -> list[str]:
 def system_side_by_side_lines(system: dict[str, Any], width: int) -> list[str]:
     gap = "   "
     left_width = min(64, max(50, (width - len(gap)) // 2))
-    right_width = max(40, width - left_width - len(gap))
-    cpu_block = section("CPU", [f"  load: {system.get('load', 'n/a')}", *render_cpu_cores(system.get("cpu_cores") or [], per_row=2)], left_width)[:-1]
-    memory_block = section("Memory / IO", system_memory_io_lines(system), right_width)[:-1]
+    cpu_block = section(
+        "CPU",
+        [f"  load: {system.get('load', 'n/a')}", *render_cpu_cores(system.get("cpu_cores") or [], per_row=2)],
+        left_width,
+    )[:-1]
+    memory_block = section("Memory / IO", system_memory_io_lines(system), left_width)[:-1]
     return join_columns(cpu_block, memory_block, left_width, gap)
+
+
+def _gpu_cluster_label(pci_id: str, runners: list[dict[str, Any]]) -> str:
+    """Find which cluster(s) own this GPU by PCI id."""
+    matches = [
+        r.get("cluster_name") or r.get("cluster_id") or "?"
+        for r in runners
+        if pci_id in (r.get("gpu_pci_ids") or [])
+    ]
+    return f" [{', '.join(matches)}]" if matches else ""
+
+
+def render_gpu_device(device: dict[str, Any], runners: list[dict[str, Any]]) -> list[str]:
+    gpu_busy = device.get("gpu_busy_percent")
+    mem_busy = device.get("mem_busy_percent")
+    vram_used = device.get("vram_used")
+    vram_total = device.get("vram_total")
+    temp = device.get("temp_c")
+    junction = device.get("junction_temp_c")
+    power = device.get("power_w")
+    fan = device.get("fan_pct")
+    fan_rpm = device.get("fan_rpm")
+    label = f"{device.get('vendor', 'GPU')} {device.get('name', '')}"
+    pci_id = device.get("pci_id") or device.get("path") or f"index {device.get('index', '?')}"
+    cluster_tag = _gpu_cluster_label(pci_id, runners)
+
+    temp_str = f"Temp {temp:.0f}°C" if temp is not None else "Temp n/a"
+    if junction is not None:
+        temp_str += f" (junction {junction:.0f}°C)"
+    power_str = f"Power {power:.1f} W" if power is not None else "Power n/a"
+    fan_str = ""
+    if fan is not None:
+        fan_str = f"   Fan {fan}%"
+        if fan_rpm is not None:
+            fan_str += f" ({fan_rpm} RPM)"
+
+    return [
+        f"  {label} ({pci_id}){cluster_tag}",
+        f"  Core {pct_text(gpu_busy):>5} {bar(gpu_busy)}   Mem busy {pct_text(mem_busy):>5} {bar(mem_busy)}",
+        f"  VRAM {format_bytes(vram_used)} / {format_bytes(vram_total)}   {temp_str}{fan_str}",
+        f"  {power_str}   SCLK {device.get('sclk') or 'n/a'}   MCLK {device.get('mclk') or 'n/a'}",
+    ]
+
+
+def render_runner(runner: dict[str, Any]) -> list[str]:
+    name = runner.get("cluster_name") or runner.get("cluster_id") or "?"
+    model = runner.get("model") or "unknown"
+    label = runner.get("label")
+    backend = runner.get("backend") or "?"
+    port = runner.get("port") or "?"
+    container = runner.get("container") or "?"
+    running = runner.get("running", False)
+    api = runner.get("api") or {}
+    tps = api.get("tps") or {}
+    gpu_pci = runner.get("gpu_pci_ids") or []
+
+    status = "running" if running else "stopped"
+    display_name = f"{model}" + (f" ({label})" if label else "")
+    gpu_str = " ".join(gpu_pci) if gpu_pci else "no GPUs"
+
+    lines = [
+        f"  [{name}] {display_name}   backend: {backend}   port: {port}   {status}",
+        f"  container: {container}",
+        f"  GPUs: {gpu_str}",
+    ]
+    if running:
+        health = api.get("health", "n/a")
+        models = api.get("models", "n/a")
+        live_tps = tps.get("live_tps")
+        active_slots = tps.get("active_slots", "n/a")
+        total_slots = tps.get("total_slots", "n/a")
+        lines.append(
+            f"  health: {health}   models: {models}"
+        )
+        lines.append(
+            f"  tokens/sec: live {tps_text(live_tps)}   slots {active_slots}/{total_slots}"
+        )
+    return lines
 
 
 def render_snapshot(snapshot: dict[str, Any], width: int | None = None, height: int | None = None) -> str:
     width = width or shutil.get_terminal_size((100, 30)).columns
     height = height or shutil.get_terminal_size((100, 30)).lines
     gpu = snapshot.get("gpu") or {}
-    llama = snapshot.get("llama")
-    api = snapshot.get("api") or {}
+    runners: list[dict[str, Any]] = snapshot.get("runners") or []
     system = snapshot.get("system") or {}
-    tps = snapshot.get("tps") or {}
     logs = snapshot.get("logs") or []
 
     lines = [f"lltop {snapshot.get('hostname', 'unknown')} {snapshot.get('time', '')}  q quit  r refresh"]
 
+    # GPU section
     if "error" in gpu:
         lines.extend(section("GPU", [f"  {gpu['error']}"], width))
     else:
         gpu_lines: list[str] = []
-        for index, device in enumerate(gpu.get("gpus") or []):
-            gpu_busy = device.get("gpu_busy_percent")
-            mem_busy = device.get("mem_busy_percent")
-            vram_used = device.get("vram_used")
-            vram_total = device.get("vram_total")
-            temp = device.get("temp_c")
-            power = device.get("power_w")
-            label = f"{device.get('vendor', 'GPU')} {device.get('name', index)}"
-            location = device.get("path") or f"index {device.get('index', index)}"
+        for device in gpu.get("gpus") or []:
             if gpu_lines:
                 gpu_lines.append("")
-            gpu_lines.extend([
-                f"  {label} ({location})",
-                f"  Core {pct_text(gpu_busy):>5} {bar(gpu_busy)}   Mem busy {pct_text(mem_busy):>5} {bar(mem_busy)}",
-                f"  VRAM {format_bytes(vram_used)} / {format_bytes(vram_total)}   Temp {temp:.1f} C" if temp is not None else f"  VRAM {format_bytes(vram_used)} / {format_bytes(vram_total)}   Temp n/a",
-                f"  Power {power:.1f} W   SCLK {device.get('sclk') or 'n/a'}   MCLK {device.get('mclk') or 'n/a'}" if power is not None else f"  Power n/a   SCLK {device.get('sclk') or 'n/a'}   MCLK {device.get('mclk') or 'n/a'}",
-            ])
-        lines.extend(
-            section(
-                "GPU",
-                gpu_lines or ["  no GPU metrics found"],
-                width,
-            )
-        )
+            gpu_lines.extend(render_gpu_device(device, runners))
+        lines.extend(section("GPU", gpu_lines or ["  no GPU metrics found"], width))
 
-    llama_lines: list[str]
-    if llama:
-        llama_lines = [
-            f"  PID {llama.get('pid', 'n/a')}   CPU {llama.get('cpu_percent', 'n/a')}%   RSS {llama.get('rss', 'n/a')}   Runtime {llama.get('etime', 'n/a')}",
-            f"  tokens/sec: live {tps_text(tps.get('live_tps'))}   active slots {tps.get('active_slots', 'n/a')}/{tps.get('total_slots', 'n/a')}   last eval {tps_text(tps.get('last_eval_tps'))}",
-            f"  {llama.get('cmd', 'n/a')}",
-        ]
+    # Runners section
+    runner_lines: list[str] = []
+    if runners:
+        for i, runner in enumerate(runners):
+            if i > 0:
+                runner_lines.append("")
+            runner_lines.extend(render_runner(runner))
     else:
-        llama_lines = ["  no llama-server process found"]
-    lines.extend(section("llama.cpp", llama_lines, width))
+        runner_lines = [
+            "  no active runners",
+            f"  (state dir: {snapshot.get('state_dir', '~/.local/share/local_llm')})",
+        ]
+    lines.extend(section("Runners", runner_lines, width))
 
-    lines.extend(section("API", [f"  health: {api.get('health', 'n/a')}", f"  models: {api.get('models', 'n/a')}"], width))
+    # System section
     system_lines = system_side_by_side_lines(system, width) if width >= 120 else system_stacked_lines(system)
     lines.extend(section("System", system_lines, width))
-    log_section = section("Recent log", [f"  {line}" for line in logs], width)
+
+    # Logs section
+    log_section = section("Logs", [f"  {line}" for line in logs], width)
     min_log_lines = min(len(log_section), 4)
     if len(lines) + min_log_lines > height:
         lines = lines[: max(0, height - min_log_lines)]
     available_log_lines = max(0, height - len(lines))
     if available_log_lines and len(log_section) > available_log_lines:
-        log_section = [log_section[0], *log_section[-(available_log_lines - 1) :]]
+        log_section = [log_section[0], *log_section[-(available_log_lines - 1):]]
     lines.extend(log_section)
 
     return "\n".join(single_line(line, width) for line in lines[:height])
 
+
+# ── curses loop ───────────────────────────────────────────────────────────────
 
 def draw(stdscr: Any, args: argparse.Namespace) -> None:
     curses.curs_set(0)
     init_colors()
     stdscr.nodelay(True)
     stdscr.timeout(250)
-    tps_tracker = TpsTracker()
+    tps_trackers: dict[int, TpsTracker] = {}
     last_refresh = 0.0
     output = ""
     while True:
         now = time.monotonic()
         if now - last_refresh >= args.interval or not output:
-            snapshot = collect_snapshot(args.drm_root, args.llama_dir, args.base_url, tps_tracker)
+            snapshot = collect_snapshot(args.drm_root, args.state_dir, args.docker_socket, tps_trackers)
+            snapshot["state_dir"] = str(args.state_dir)
             height, width = stdscr.getmaxyx()
             output = render_snapshot(snapshot, width=width, height=height)
             stdscr.erase()
@@ -774,19 +906,34 @@ def draw(stdscr: Any, args: argparse.Namespace) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Monitor llama.cpp and AMD GPU usage")
-    parser.add_argument("--once", action="store_true", help="print one dashboard snapshot and exit")
+    parser = argparse.ArgumentParser(
+        description="Monitor local_llm containers — mixed AMD/NVIDIA, multi-cluster"
+    )
+    parser.add_argument("--once", action="store_true", help="print one snapshot and exit")
     parser.add_argument("--interval", type=float, default=1.0, help="refresh interval in seconds")
     parser.add_argument("--drm-root", type=Path, default=DEFAULT_DRM_ROOT, help="DRM sysfs root")
-    parser.add_argument("--llama-dir", type=Path, default=DEFAULT_LLAMA_DIR, help="llama.cpp directory containing model.log")
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="llama.cpp server base URL")
+    parser.add_argument(
+        "--state-dir",
+        type=Path,
+        default=DEFAULT_STATE_DIR,
+        help="local_llm state directory (contains runs/active/, runs/clusters/)",
+    )
+    parser.add_argument(
+        "--docker-socket",
+        type=Path,
+        default=DEFAULT_DOCKER_SOCKET,
+        help="Docker socket path",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.once:
-        print(render_snapshot(collect_snapshot(args.drm_root, args.llama_dir, args.base_url, TpsTracker())))
+        tps_trackers: dict[int, TpsTracker] = {}
+        snapshot = collect_snapshot(args.drm_root, args.state_dir, args.docker_socket, tps_trackers)
+        snapshot["state_dir"] = str(args.state_dir)
+        print(render_snapshot(snapshot))
         return 0
     curses.wrapper(draw, args)
     return 0

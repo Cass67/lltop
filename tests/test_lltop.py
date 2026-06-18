@@ -24,33 +24,49 @@ class LltopTests(unittest.TestCase):
         return {
             "hostname": "ubt26",
             "time": "12:34:56",
+            "state_dir": "/home/cass/.local/share/local_llm",
             "gpu": {
                 "gpus": [
                     {
                         "vendor": "AMD",
-                        "name": "Radeon",
+                        "name": "Radeon RX 7900 XT",
                         "path": "/sys/class/drm/card2/device",
+                        "pci_id": "0000:03:00.0",
                         "gpu_busy_percent": 37,
                         "mem_busy_percent": 12,
                         "vram_used": 10729029632,
                         "vram_total": 21458059264,
                         "temp_c": 46.0,
+                        "junction_temp_c": 52.0,
                         "power_w": 10.0,
+                        "fan_pct": 30,
+                        "fan_rpm": 900,
                         "sclk": "S: 2475Mhz *",
                         "mclk": "1: 1249Mhz *",
                     }
                 ],
             },
-            "llama": {
-                "pid": "1234",
-                "cpu_percent": "82.5",
-                "rss": "18.2g",
-                "etime": "01:02:03",
-                "cmd": "./build/bin/llama-server -c 49152 --alias qwen3-coder",
-            },
-            "api": {"health": "ok", "models": "qwen3-coder"},
+            "runners": [
+                {
+                    "cluster_id": "abc123",
+                    "cluster_name": "amd-dual",
+                    "model": "Qwen3-30B-A3B-Q4",
+                    "family": "qwen3-30b",
+                    "label": None,
+                    "backend": "rocm",
+                    "port": 8080,
+                    "container": "local-llm-runner-cluster-amd-dual-abc123",
+                    "gpu_pci_ids": ["0000:03:00.0", "0000:04:00.0"],
+                    "running": True,
+                    "api": {
+                        "health": "ok",
+                        "models": "Qwen3-30B-A3B-Q4",
+                        "tps": {"live_tps": 45.2, "active_slots": 1, "total_slots": 1},
+                    },
+                }
+            ],
             "system": {"load": "1.00 0.75 0.50", "mem": "Mem: 1 2 3"},
-            "logs": ["main: server is listening", "slot 0 idle"],
+            "logs": ["[amd-dual]", "main: server is listening", "slot 0 idle"],
         }
 
     def test_format_bytes_uses_binary_units(self):
@@ -145,98 +161,6 @@ class LltopTests(unittest.TestCase):
             {"live_tps": 20.0, "active_slots": 1, "total_slots": 1},
         )
 
-    def test_collect_tps_marks_unavailable_slots_as_unknown(self):
-        lltop = load_lltop()
-        original_http = lltop.http_json_or_text
-        original_last_eval = lltop.read_last_eval_tps
-        try:
-            lltop.http_json_or_text = lambda *args, **kwargs: "unreachable: URLError"
-            lltop.read_last_eval_tps = lambda *args, **kwargs: None
-
-            stats = lltop.collect_tps("http://127.0.0.1:8080", Path("/tmp"), lltop.TpsTracker())
-        finally:
-            lltop.http_json_or_text = original_http
-            lltop.read_last_eval_tps = original_last_eval
-
-        self.assertEqual(
-            stats,
-            {"live_tps": None, "active_slots": "n/a", "total_slots": "n/a", "last_eval_tps": None},
-        )
-
-    def test_parse_last_eval_tps_ignores_prompt_eval(self):
-        lltop = load_lltop()
-        lines = [
-            "prompt eval time = 100.00 ms / 100 tokens (1.00 ms per token, 1000.00 tokens per second)",
-            "       eval time = 2000.00 ms / 100 tokens (20.00 ms per token, 50.00 tokens per second)",
-        ]
-
-        self.assertEqual(lltop.parse_last_eval_tps(lines), 50.0)
-
-    def test_newest_log_prefers_model_log_over_legacy_logs(self):
-        lltop = load_lltop()
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            model = root / "model.log"
-            legacy = root / "llama-20260524-130000.log"
-            model.write_text("current model\n")
-            legacy.write_text("old model\n")
-            legacy.touch()
-            model.touch()
-
-            self.assertEqual(lltop.newest_log(root), model)
-
-    def test_newest_log_prefers_highest_timestamped_log_name(self):
-        lltop = load_lltop()
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            older = root / "llama-20260524-120000.log"
-            newer = root / "llama-20260524-130000.log"
-            older.write_text("old\n")
-            newer.write_text("new\n")
-            older.touch()
-            newer.touch()
-            older.touch()
-
-            self.assertEqual(lltop.newest_log(root), newer)
-
-    def test_newest_log_finds_llama_speed_log(self):
-        lltop = load_lltop()
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            # Create a dated log and llama-speed.log
-            dated = root / "llama-20260524-120000.log"
-            dated.write_text("dated\n")
-            dated.touch()
-            
-            speed = root / "llama-speed.log"
-            speed.write_text("speed\n")
-            
-            # newest_log should prefer dated log
-            self.assertEqual(lltop.newest_log(root), dated)
-
-    def test_newest_log_returns_llama_speed_when_only_speed_exists(self):
-        lltop = load_lltop()
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            # Only create llama-speed.log
-            speed = root / "llama-speed.log"
-            speed.write_text("speed\n")
-            
-            # newest_log should return llama-speed.log
-            self.assertEqual(lltop.newest_log(root), speed)
-
-    def test_read_recent_logs_missing_mentions_model_log(self):
-        lltop = load_lltop()
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-
-            self.assertEqual(lltop.read_recent_logs(root), [f"no model.log or llama-*.log files found in {root}"])
-
     def test_collect_gpu_reads_all_amd_sysfs_devices(self):
         lltop = load_lltop()
 
@@ -262,7 +186,10 @@ class LltopTests(unittest.TestCase):
             hwmon = amd / "hwmon" / "hwmon4"
             hwmon.mkdir(parents=True)
             (hwmon / "temp1_input").write_text("46000\n")
+            (hwmon / "temp2_input").write_text("52000\n")
             (hwmon / "power1_average").write_text("10000000\n")
+            (hwmon / "fan1_input").write_text("900\n")
+            (hwmon / "pwm1").write_text("77\n")  # ~30%
 
             gpu = lltop.collect_gpu(root)
 
@@ -274,7 +201,9 @@ class LltopTests(unittest.TestCase):
         self.assertEqual(gpu["gpus"][0]["vram_used"], 10729029632)
         self.assertEqual(gpu["gpus"][0]["vram_total"], 21458059264)
         self.assertEqual(gpu["gpus"][0]["temp_c"], 46.0)
+        self.assertEqual(gpu["gpus"][0]["junction_temp_c"], 52.0)
         self.assertEqual(gpu["gpus"][0]["power_w"], 10.0)
+        self.assertEqual(gpu["gpus"][0]["fan_rpm"], 900)
         self.assertEqual(gpu["gpus"][1]["path"], str(amd2))
         self.assertEqual(gpu["gpus"][1]["gpu_busy_percent"], 5)
 
@@ -282,46 +211,46 @@ class LltopTests(unittest.TestCase):
         lltop = load_lltop()
         original_run_command = lltop.run_command
         try:
-            lltop.run_command = lambda *args, **kwargs: "Tesla P40, 83, 21, 1024, 22919, 62, 94.50, 1328, 3615"
+            # 11 fields: name, pci.bus_id, util.gpu, util.mem, mem.used, mem.total,
+            #            temp, power, clocks.sm, clocks.mem, fan.speed
+            lltop.run_command = lambda *args, **kwargs: (
+                "Tesla P40, 00000000:03:00.0, 83, 21, 1024, 22919, 62, 94.50, 1328, 3615, 45"
+            )
 
             gpus = lltop.collect_nvidia_gpus()
         finally:
             lltop.run_command = original_run_command
 
-        self.assertEqual(
-            gpus,
-            [
-                {
-                    "vendor": "NVIDIA",
-                    "name": "Tesla P40",
-                    "index": 0,
-                    "gpu_busy_percent": 83,
-                    "mem_busy_percent": 21,
-                    "vram_used": 1073741824,
-                    "vram_total": 24032313344,
-                    "temp_c": 62.0,
-                    "power_w": 94.5,
-                    "sclk": "1328 MHz",
-                    "mclk": "3615 MHz",
-                }
-            ],
-        )
+        self.assertEqual(len(gpus), 1)
+        gpu = gpus[0]
+        self.assertEqual(gpu["vendor"], "NVIDIA")
+        self.assertEqual(gpu["name"], "Tesla P40")
+        self.assertEqual(gpu["pci_id"], "03:00.0")
+        self.assertEqual(gpu["gpu_busy_percent"], 83)
+        self.assertEqual(gpu["mem_busy_percent"], 21)
+        self.assertEqual(gpu["vram_used"], 1073741824)
+        self.assertEqual(gpu["vram_total"], 24032313344)
+        self.assertEqual(gpu["temp_c"], 62.0)
+        self.assertEqual(gpu["power_w"], 94.5)
+        self.assertEqual(gpu["fan_pct"], 45)
+        self.assertEqual(gpu["sclk"], "1328 MHz")
+        self.assertEqual(gpu["mclk"], "3615 MHz")
 
-    def test_render_snapshot_contains_gpu_llama_api_and_logs(self):
+    def test_render_snapshot_contains_gpu_runners_and_logs(self):
         lltop = load_lltop()
         snapshot = self.sample_snapshot()
 
-        output = lltop.render_snapshot(snapshot, width=100, height=24)
+        output = lltop.render_snapshot(snapshot, width=120, height=32)
 
         self.assertIn("lltop ubt26 12:34:56", output)
         self.assertIn("GPU", output)
         self.assertIn("37%", output)
         self.assertIn("10.0 GiB / 20.0 GiB", output)
-        self.assertIn("llama.cpp", output)
-        self.assertIn("PID 1234", output)
-        self.assertIn("API", output)
-        self.assertIn("qwen3-coder", output)
-        self.assertIn("Recent log", output)
+        self.assertIn("Runners", output)
+        self.assertIn("Qwen3-30B-A3B-Q4", output)
+        self.assertIn("rocm", output)
+        self.assertIn("amd-dual", output)
+        self.assertIn("Logs", output)
         self.assertIn("slot 0 idle", output)
 
     def test_render_snapshot_shows_amd_and_nvidia_gpus(self):
@@ -332,55 +261,119 @@ class LltopTests(unittest.TestCase):
                 "vendor": "NVIDIA",
                 "name": "Tesla P40",
                 "index": 0,
+                "pci_id": "0000:06:00.0",
                 "gpu_busy_percent": 83,
                 "mem_busy_percent": 21,
                 "vram_used": 1073741824,
                 "vram_total": 24032313344,
                 "temp_c": 62.0,
                 "power_w": 94.5,
+                "fan_pct": 45,
                 "sclk": "1328 MHz",
                 "mclk": "3615 MHz",
             }
         )
 
-        output = lltop.render_snapshot(snapshot, width=120, height=32)
+        output = lltop.render_snapshot(snapshot, width=120, height=40)
 
-        self.assertIn("AMD Radeon", output)
+        self.assertIn("AMD", output)
         self.assertIn("NVIDIA Tesla P40", output)
         self.assertIn("83%", output)
         self.assertIn("1.0 GiB / 22.4 GiB", output)
 
-    def test_llama_panel_shows_token_throughput(self):
+    def test_runner_panel_shows_token_throughput(self):
         lltop = load_lltop()
         snapshot = self.sample_snapshot()
-        snapshot["tps"] = {"live_tps": 58.9, "active_slots": 1, "total_slots": 4, "last_eval_tps": 59.5}
 
         output = lltop.render_snapshot(snapshot, width=120, height=32)
 
-        self.assertIn("tokens/sec: live 58.9", output)
-        self.assertIn("active slots 1/4", output)
-        self.assertIn("last eval 59.5", output)
+        self.assertIn("tokens/sec: live 45.2", output)
+        self.assertIn("slots 1/1", output)
+
+    def test_runner_panel_shows_stopped_when_not_running(self):
+        lltop = load_lltop()
+        snapshot = self.sample_snapshot()
+        snapshot["runners"][0]["running"] = False
+        snapshot["runners"][0]["api"] = {"health": "stopped", "models": "n/a", "tps": {}}
+
+        output = lltop.render_snapshot(snapshot, width=120, height=32)
+
+        self.assertIn("stopped", output)
+
+    def test_render_snapshot_shows_gpu_cluster_assignment(self):
+        lltop = load_lltop()
+        snapshot = self.sample_snapshot()
+        # GPU pci_id 0000:03:00.0 is in the amd-dual cluster's gpu_pci_ids
+        snapshot["runners"][0]["gpu_pci_ids"] = ["0000:03:00.0"]
+
+        output = lltop.render_snapshot(snapshot, width=120, height=32)
+
+        # GPU line should mention the cluster
+        self.assertIn("amd-dual", output)
 
     def test_render_snapshot_uses_ascii_panels(self):
         lltop = load_lltop()
 
-        output = lltop.render_snapshot(self.sample_snapshot(), width=100, height=30)
+        output = lltop.render_snapshot(self.sample_snapshot(), width=120, height=32)
 
         self.assertIn("+-- GPU ", output)
-        self.assertIn("+-- llama.cpp ", output)
-        self.assertIn("+-- API ", output)
+        self.assertIn("+-- Runners ", output)
         self.assertIn("+-- System ", output)
-        self.assertIn("+-- Recent log ", output)
+        self.assertIn("+-- Logs ", output)
 
-    def test_render_snapshot_keeps_recent_log_visible_when_height_is_limited(self):
+    def test_render_snapshot_keeps_logs_visible_when_height_is_limited(self):
         lltop = load_lltop()
         snapshot = self.sample_snapshot()
         snapshot["logs"] = [f"line {index}" for index in range(20)]
 
-        output = lltop.render_snapshot(snapshot, width=100, height=18)
+        output = lltop.render_snapshot(snapshot, width=120, height=18)
 
-        self.assertIn("+-- Recent log ", output)
+        self.assertIn("+-- Logs ", output)
         self.assertIn("line 19", output)
+
+    def test_render_snapshot_shows_no_runners_placeholder(self):
+        lltop = load_lltop()
+        snapshot = self.sample_snapshot()
+        snapshot["runners"] = []
+
+        output = lltop.render_snapshot(snapshot, width=120, height=32)
+
+        self.assertIn("no active runners", output)
+
+    def test_gpu_cluster_label_matches_by_pci_id(self):
+        lltop = load_lltop()
+        runners = [
+            {"cluster_name": "amd-dual", "gpu_pci_ids": ["0000:03:00.0", "0000:04:00.0"]},
+            {"cluster_name": "nvidia-p40", "gpu_pci_ids": ["0000:06:00.0"]},
+        ]
+
+        label = lltop._gpu_cluster_label("0000:03:00.0", runners)
+        self.assertEqual(label, " [amd-dual]")
+
+        label2 = lltop._gpu_cluster_label("0000:06:00.0", runners)
+        self.assertEqual(label2, " [nvidia-p40]")
+
+        label3 = lltop._gpu_cluster_label("0000:99:00.0", runners)
+        self.assertEqual(label3, "")
+
+    def test_docker_decode_log_bytes_strips_multiplex_headers(self):
+        lltop = load_lltop()
+        # Simulate Docker log frame: stream=1 (stdout), size=12
+        msg = b"hello world\n"
+        header = b"\x01\x00\x00\x00" + len(msg).to_bytes(4, "big")
+        raw = header + msg
+
+        result = lltop._decode_docker_log_bytes(raw)
+
+        self.assertEqual(result, "hello world\n")
+
+    def test_docker_decode_log_bytes_fallback_for_raw_text(self):
+        lltop = load_lltop()
+        raw = b"plain text without headers\n"
+
+        result = lltop._decode_docker_log_bytes(raw)
+
+        self.assertEqual(result, "plain text without headers\n")
 
     def test_system_panel_shows_cpu_cores_and_memory_headers(self):
         lltop = load_lltop()
@@ -388,7 +381,7 @@ class LltopTests(unittest.TestCase):
         snapshot["system"]["cpu_cores"] = [("0", 50), ("1", 20)]
         snapshot["system"]["swap"] = "Swap: 8.0Gi 811Mi 7.2Gi"
 
-        output = lltop.render_snapshot(snapshot, width=100, height=32)
+        output = lltop.render_snapshot(snapshot, width=100, height=40)
 
         self.assertIn("CPU cores:", output)
         self.assertIn("00 [#####-----] 50%", output)
@@ -416,7 +409,7 @@ class LltopTests(unittest.TestCase):
             }
         )
 
-        output = lltop.render_snapshot(snapshot, width=140, height=40)
+        output = lltop.render_snapshot(snapshot, width=140, height=50)
 
         self.assertIn("+-- CPU ", output)
         self.assertIn("+-- Memory / IO ", output)
@@ -429,10 +422,41 @@ class LltopTests(unittest.TestCase):
         snapshot = self.sample_snapshot()
         snapshot["system"]["cpu_cores"] = [("0", 50), ("1", 20)]
 
-        output = lltop.render_snapshot(snapshot, width=100, height=32)
+        output = lltop.render_snapshot(snapshot, width=100, height=40)
 
         self.assertIn("+-- System ", output)
         self.assertNotIn("+-- Memory / IO ", output)
+
+    def test_amd_gpu_shows_fan_and_junction_temp(self):
+        lltop = load_lltop()
+        snapshot = self.sample_snapshot()
+
+        output = lltop.render_snapshot(snapshot, width=120, height=32)
+
+        self.assertIn("junction", output)
+        self.assertIn("Fan 30%", output)
+        self.assertIn("900 RPM", output)
+
+    def test_read_json_dir_returns_empty_for_missing_dir(self):
+        lltop = load_lltop()
+
+        result = lltop._read_json_dir(Path("/nonexistent/path"))
+
+        self.assertEqual(result, [])
+
+    def test_read_json_dir_reads_json_files(self):
+        lltop = load_lltop()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "a.json").write_text('{"x": 1}')
+            (d / "b.json").write_text('{"x": 2}')
+            (d / "c.txt").write_text("ignored")
+
+            result = lltop._read_json_dir(d)
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual({r["x"] for r in result}, {1, 2})
 
 
 if __name__ == "__main__":
