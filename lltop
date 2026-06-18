@@ -113,6 +113,12 @@ def first_glob(root: Path, pattern: str) -> Path | None:
 
 # ── GPU collection ────────────────────────────────────────────────────────────
 
+def _lspci_name(pci_id: str) -> str:
+    out = run_command(["lspci", "-s", pci_id], timeout=2.0)
+    m = re.search(r"(?:VGA|Display|3D)[^:]*:\s*(.+?)(?:\s*\(rev|\s*$)", out)
+    return m.group(1).strip() if m else ""
+
+
 def collect_amd_gpus(drm_root: Path = DEFAULT_DRM_ROOT) -> list[dict[str, Any]]:
     gpus: list[dict[str, Any]] = []
     for device in sorted(drm_root.glob("card*/device")):
@@ -133,9 +139,11 @@ def collect_amd_gpus(drm_root: Path = DEFAULT_DRM_ROOT) -> list[dict[str, Any]]:
         except OSError:
             pci_id = device.parts[-2]  # cardN
 
+        name = _lspci_name(pci_id) or "Radeon"
+
         gpus.append({
             "vendor": "AMD",
-            "name": "Radeon",
+            "name": name,
             "path": str(device),
             "pci_id": pci_id,
             "gpu_busy_percent": read_int(device / "gpu_busy_percent"),
@@ -798,11 +806,12 @@ def render_runner(runner: dict[str, Any]) -> list[str]:
     gpu_pci = runner.get("gpu_pci_ids") or []
 
     status = "running" if running else "stopped"
-    display_name = f"{model}" + (f" ({label})" if label else "")
     gpu_str = " ".join(gpu_pci) if gpu_pci else "no GPUs"
 
+    # Status on line 1 so it's never truncated off-screen
     lines = [
-        f"  [{name}] {display_name}   backend: {backend}   port: {port}   {status}",
+        f"  [{name}]  {status}   {backend}   :{port}",
+        f"  model: {model}" + (f"  ({label})" if label else ""),
         f"  container: {container}",
         f"  GPUs: {gpu_str}",
     ]
@@ -812,12 +821,8 @@ def render_runner(runner: dict[str, Any]) -> list[str]:
         live_tps = tps.get("live_tps")
         active_slots = tps.get("active_slots", "n/a")
         total_slots = tps.get("total_slots", "n/a")
-        lines.append(
-            f"  health: {health}   models: {models}"
-        )
-        lines.append(
-            f"  tokens/sec: live {tps_text(live_tps)}   slots {active_slots}/{total_slots}"
-        )
+        lines.append(f"  health: {health}   models: {models}")
+        lines.append(f"  tokens/sec: live {tps_text(live_tps)}   slots {active_slots}/{total_slots}")
     return lines
 
 
