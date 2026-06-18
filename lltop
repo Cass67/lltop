@@ -146,9 +146,13 @@ def collect_amd_gpus(drm_root: Path = DEFAULT_DRM_ROOT) -> list[dict[str, Any]]:
 
         # PCI id for cluster correlation
         try:
-            pci_id = device.resolve().name
+            resolved = device.resolve()
+            pci_id = resolved.name
+            # Also record the upstream bridge PCI id (one level up in PCI hierarchy)
+            upstream_pci_id = resolved.parent.name
         except OSError:
             pci_id = device.parts[-2]  # cardN
+            upstream_pci_id = ""
 
         name = _lspci_name(pci_id) or "Radeon"
 
@@ -157,6 +161,7 @@ def collect_amd_gpus(drm_root: Path = DEFAULT_DRM_ROOT) -> list[dict[str, Any]]:
             "name": name,
             "path": str(device),
             "pci_id": pci_id,
+            "upstream_pci_id": upstream_pci_id,
             "gpu_busy_percent": read_int(device / "gpu_busy_percent"),
             "mem_busy_percent": read_int(device / "mem_busy_percent"),
             "vram_used": read_int(device / "mem_info_vram_used"),
@@ -762,12 +767,13 @@ def system_side_by_side_lines(system: dict[str, Any], width: int) -> list[str]:
     return join_columns(cpu_block, memory_block, left_width, gap)
 
 
-def _gpu_cluster_label(pci_id: str, runners: list[dict[str, Any]]) -> str:
-    """Find which cluster(s) own this GPU by PCI id."""
+def _gpu_cluster_label(pci_id: str, runners: list[dict[str, Any]], upstream_pci_id: str = "") -> str:
+    """Find which cluster owns this GPU by PCI id, falling back to upstream bridge id."""
     matches = [
         r.get("cluster_name") or r.get("cluster_id") or "?"
         for r in runners
         if pci_id in (r.get("gpu_pci_ids") or [])
+        or (upstream_pci_id and upstream_pci_id in (r.get("gpu_pci_ids") or []))
     ]
     return f" [{', '.join(matches)}]" if matches else ""
 
@@ -784,7 +790,8 @@ def render_gpu_device(device: dict[str, Any], runners: list[dict[str, Any]]) -> 
     fan_rpm = device.get("fan_rpm")
     label = f"{device.get('vendor', 'GPU')} {device.get('name', '')}"
     pci_id = device.get("pci_id") or device.get("path") or f"index {device.get('index', '?')}"
-    cluster_tag = _gpu_cluster_label(pci_id, runners)
+    upstream = device.get("upstream_pci_id") or ""
+    cluster_tag = _gpu_cluster_label(pci_id, runners, upstream)
 
     temp_str = f"Temp {temp:.0f}°C" if temp is not None else "Temp n/a"
     if junction is not None:
